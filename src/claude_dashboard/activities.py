@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "9"
+RULES_VERSION = "14"
 
 ACTIVITIES = (
     "code", "docs", "test", "eval", "train", "review",
@@ -275,6 +275,102 @@ def _is_read_cmd(part: str, heredoc: bool) -> bool:
     return head in _READ_CMDS
 
 
+# ── command signatures (the drill-down under an activity) ────────────────────
+
+WAIT_PREFIX = "wait → "
+ITEMS_KEPT = 100
+PROGRAMS_KEPT = 300
+OTHER_COMMANDS = "(other commands)"
+_NEUTRAL_HEADS = {"cd", "echo", "printf", "export", "unset", "set", "source", ".", "true", "mkdir", "date"}
+_REDIRECT = re.compile(r"\s*\d?>>?&?\s*(\S+)?|\s*<\s*\S+")
+_ABS_PATH = re.compile(r"(?<![\w.])(?:~|/)[\w.@+-]*(?:/[\w.@+{}$-]+)+")
+_MASK = str.maketrans({"|": "\x00", ";": "\x01", "&": "\x02", "\n": "\x03"})
+_UNMASK = str.maketrans({"\x00": "|", "\x01": ";", "\x02": "&", "\x03": "\n"})
+_CONTENT_WRITERS = {"cat", "tee", "echo", "printf"}
+_NUMBERISH = re.compile(r"\b(?=[\da-f-]*\d)[\da-f]{6,}(?:-[\da-f]{4,})*\b|\b\d+\b")
+
+
+def signature(name: str, inp: dict) -> str:
+    """A short, normalised label of what one tool call did: the main shell
+    command without cd/env wrappers, output pipes, redirects, absolute
+    directories or ids; for other tools the tool and (for files) the file name."""
+    if name in ("Bash", "Monitor"):
+        return _command_signature(inp.get("command") or "")
+    if name in _EDIT_TOOLS or name == "Read":
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        return f"{name} {path.rsplit('/', 1)[-1]}".strip()
+    if name == "Agent":
+        return f"Agent ({inp.get('subagent_type') or 'general-purpose'})"
+    if name.startswith("mcp__"):
+        return name.removeprefix("mcp__").replace("__", " ")
+    return name
+
+
+def _command_signature(command: str) -> str:
+    shell = _HEREDOC.sub(" <<heredoc\n", command)
+    # Commands of the sequence, each cut at its first pipe (the rest only formats
+    # output). Separators inside quotes are masked so they do not split.
+    masked = _QUOTED.sub(lambda m: m.group(0).translate(_MASK), shell)
+    parts, runs = [], []
+    for seq in re.split(r"&&|\|\||;|\n", masked):
+        seq = seq.split("|", 1)[0].translate(_UNMASK).strip()
+        words = _strip_wrappers(seq.split()) if seq else None
+        if words and words[0].rsplit("/", 1)[-1] not in _NEUTRAL_HEADS:
+            parts.append(" ".join(words))
+            if _TEST_CMD.search(seq) or _is_run(words):
+                runs.append(parts[-1])
+    # The run in a sequence (`rm -rf x && uv run pytest`) is what it did.
+    text = (runs or parts or [shell.strip()])[0]
+    inline = "<<heredoc" in text
+    text = text.replace("<<heredoc", "")
+    words = text.split()
+    if words and words[0] in _CONTENT_WRITERS and (target := _SHELL_WRITE.search(text)):
+        text = f"{words[0]} > {target.group(1)}"  # a file written from the shell
+        inline = False
+    else:
+        text = _REDIRECT.sub("", text).rstrip(" &")
+    if inline:
+        text += " <<inline script"
+    text = _ABS_PATH.sub(lambda m: "…/" + m.group(0).rstrip("/").rsplit("/", 1)[-1], text)
+    text = _NUMBERISH.sub("N", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:100] or "(empty)"
+
+
+def program_of(sig: str) -> str:
+    """The program part of a signature: up to its first flag, quote or path
+    (`pytest tests`, `gh run watch`, `aws batch submit-job`); file tools by
+    extension (`Edit *.py`)."""
+    if sig.startswith(WAIT_PREFIX):
+        return WAIT_PREFIX + program_of(sig.removeprefix(WAIT_PREFIX))
+    words = sig.split(" ")
+    if words[0] in _EDIT_TOOLS or words[0] == "Read":
+        name = words[1] if len(words) > 1 else ""
+        return f"{words[0]} *.{name.rsplit('.', 1)[-1]}" if "." in name else words[0]
+    if len(words) >= 3 and words[1] in (">", ">>"):
+        name = words[2].rsplit("/", 1)[-1]
+        return f"{words[0]} > *.{name.rsplit('.', 1)[-1]}" if "." in name else f"{words[0]} >"
+    out = []
+    for w in words:
+        if w.startswith(("-", '"', "'")):
+            break
+        if "/" in w or "…" in w:
+            out.append(w.rsplit("/", 1)[-1])
+            break
+        out.append(w)
+        if len(out) >= 3:
+            break
+    return " ".join(out) or words[0]
+
+
+def _call_signature(call: dict, act: str) -> str:
+    """The signature of the tool that decided the call's activity."""
+    for tool_act, sig in zip(call["tools"], call["sigs"]):
+        if tool_act == act:
+            return sig
+    return call["sigs"][0] if call["sigs"] else "(no tool)"
+
+
 def classify_tool(name: str, inp: dict) -> str:
     if name in _EDIT_TOOLS:
         path = inp.get("file_path") or inp.get("notebook_path") or ""
@@ -330,9 +426,11 @@ class ActivityTracker:
         self.turn = 0                       # bumped at every user/notification boundary
         self.last_ms: float | None = None
         self.task_acts: dict[str, str] = {}  # background task id -> act ("agent" for a subagent)
+        self.task_sigs: dict[str, str] = {}  # background task id -> signature of what it runs
+        self.tool_sigs: dict[str, str] = {}  # tool_use id -> signature
         self.untimed: set[str] = set()       # tool_use ids whose run time is not ours
-        self.last_run: str | None = None     # activity of the latest test/eval/train/build run
-        self.run_paths: dict[str, str] = {}  # path / job id named by a test/eval/train run -> act
+        self.last_run: tuple[str, str] | None = None  # (act, sig) of the latest test/eval/train/build run
+        self.run_paths: dict[str, tuple[str, str]] = {}  # path / job id named by a run -> (act, sig)
 
     def feed(self, line: dict):
         ltype = line.get("type")
@@ -355,8 +453,8 @@ class ActivityTracker:
             return
         call = self.calls.get(rid)
         if call is None:
-            call = {"model": model, "usage": {}, "tools": [], "time_ms": 0, "turn": self.turn,
-                    "day": _local_day(now)}
+            call = {"model": model, "usage": {}, "tools": [], "sigs": [], "time_ms": 0,
+                    "turn": self.turn, "day": _local_day(now)}
             self.calls[rid] = call
             self.order.append(rid)
         call["time_ms"] += self._gap(now)  # generation latency (and streaming)
@@ -366,7 +464,7 @@ class ActivityTracker:
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 name, inp = block.get("name", ""), block.get("input") or {}
-                act = self._classify(name, inp)
+                act, sig = self._classify(name, inp)
                 if name == "TaskOutput":
                     # Waiting on a background task: it is that task's work. A
                     # subagent's work is timed in its own transcript.
@@ -375,8 +473,12 @@ class ActivityTracker:
                         act = "coord"
                         self.untimed.add(block.get("id"))
                 call["tools"].append(act)
+                if name == "TaskOutput":
+                    sig = self.task_sigs.get(str(inp.get("task_id")), sig)
+                call["sigs"].append(sig)
                 if block.get("id"):
                     self.tool_owner[block["id"]] = (rid, block.get("name", ""), act)
+                    self.tool_sigs[block["id"]] = sig
 
     def _user(self, line: dict, now: float | None):
         content = (line.get("message") or {}).get("content")
@@ -389,10 +491,12 @@ class ActivityTracker:
                         text = str(block.get("content"))[:4000]
                         for tid in _TASK_ID.findall(text):
                             self.task_acts[tid] = "agent" if found[1] == "Agent" else found[2]
+                            self.task_sigs[tid] = self.tool_sigs.get(block.get("tool_use_id"), "")
                     if found and found[2] in _RUN_ACTS:
                         # A run's result names where it writes / what it started
                         # (background output file, batch job id) — waits poll those.
-                        self._remember(str(block.get("content"))[:4000], found[2])
+                        self._remember(str(block.get("content"))[:4000], found[2],
+                                       self.tool_sigs.get(block.get("tool_use_id"), ""))
                     if found and not owner:
                         owner, owner_id = found, block.get("tool_use_id")
                         if _REFUSED.search(str(block.get("content"))[:2000]):
@@ -411,37 +515,42 @@ class ActivityTracker:
         if now is not None:
             self.last_ms = now
 
-    def _classify(self, name: str, inp: dict) -> str:
+    def _classify(self, name: str, inp: dict) -> tuple[str, str]:
+        """(activity, signature) of one tool call."""
         cmd = inp.get("command") or ""
         act = "wait" if name == "Monitor" else classify_tool(name, inp)
+        sig = signature(name, inp)
         if act in _RUN_ACTS:
-            self.last_run = act
+            self.last_run = (act, sig)
             if cmd:
-                self._remember(_HEREDOC.sub(" ", cmd), act)
+                self._remember(_HEREDOC.sub(" ", cmd), act, sig)
         if act == "wait":
-            act = self._resolve_wait(cmd)
-        return act
+            act, run_sig = self._resolve_wait(cmd)
+            if run_sig:  # label the wait by the run it waits on, never nested
+                sig = run_sig if run_sig.startswith(WAIT_PREFIX) else WAIT_PREFIX + run_sig
+        return act, sig
 
-    def _remember(self, text: str, act: str):
+    def _remember(self, text: str, act: str, sig: str):
         for token in _PATH_TOKEN.findall(text) + _JOB_ID.findall(text):
-            self.run_paths[token] = act
+            self.run_paths[token] = (act, sig)
 
-    def _resolve_wait(self, cmd: str) -> str:
+    def _resolve_wait(self, cmd: str) -> tuple[str, str | None]:
         """A wait belongs to what it waits on: a run whose log/output path it
         names (latest wins), else the words of the wait itself, else CI = test,
-        else the latest run of this thread."""
-        hits = [act for path, act in self.run_paths.items() if path in cmd]
+        else the latest run of this thread. Returns (activity, the signature of
+        the run waited on when known)."""
+        hits = [run for path, run in self.run_paths.items() if path in cmd]
         if hits:
             return hits[-1]
         act = classify_run(_QUOTED.sub(lambda m: m.group(0).replace("/", " "), cmd))
         if act:
-            return act
+            return act, None
         if _BUILD_WORDS.search(cmd.lower()):
-            return "build"
+            return "build", None
         if _CI_WAIT.search(cmd) or _TEST_OUTCOME.search(cmd):
-            return "test"
+            return "test", None
         # A bare timer (`sleep 600`, then check) waits on whatever was last launched.
-        return self.last_run or "other"
+        return self.last_run or ("other", None)
 
     def _activity(self, call: dict) -> str:
         if self.review:
@@ -458,12 +567,17 @@ class ActivityTracker:
 
         acts = [self._activity(self.calls[rid]) for rid in self.order]
         by: dict[str, dict] = {}
+        items: dict[str, dict] = {}
+        programs: dict[str, dict] = {}
         nxt: dict[str, dict] = {}
         by_day: dict[str, dict] = {}
         for i, rid in enumerate(self.order):
             call, act = self.calls[rid], acts[i]
             day = by_day.setdefault(call["day"] or "unknown", {})
-            buckets = [by.setdefault(act, empty_bucket()), day.setdefault(act, empty_bucket())]
+            sig = _call_signature(call, act)
+            buckets = [by.setdefault(act, empty_bucket()), day.setdefault(act, empty_bucket()),
+                       items.setdefault(act, {}).setdefault(sig, empty_bucket()),
+                       programs.setdefault(act, {}).setdefault(program_of(sig), empty_bucket())]
             if act in EXPLORATION:
                 follow = "other"  # the turn ended on reading/answering
                 for j in range(i + 1, len(self.order)):
@@ -477,17 +591,47 @@ class ActivityTracker:
                 _apply_tokens(b["tokens_by_model"], call["model"], call["usage"])
                 b["time_ms"] += call["time_ms"]
                 b["calls"] += 1
-        return {"by_activity": by, "explore_next": nxt, "by_day": by_day}
+        return {"by_activity": by, "explore_next": nxt, "by_day": by_day,
+                "items": items, "programs": programs}
 
 
 def merge_activities(base: dict, extra: dict) -> dict:
     """Add `extra` (a result() dict) into `base` in place."""
     for section in ("by_activity", "explore_next"):
         _merge_buckets(base.setdefault(section, {}), extra.get(section) or {})
-    days = base.setdefault("by_day", {})
-    for day, acts in (extra.get("by_day") or {}).items():
-        _merge_buckets(days.setdefault(day, {}), acts)
+    for section in ("by_day", "items", "programs"):
+        dst = base.setdefault(section, {})
+        for key, buckets in (extra.get(section) or {}).items():
+            _merge_buckets(dst.setdefault(key, {}), buckets)
     return base
+
+
+def trim_items(activities: dict) -> dict:
+    """Bound a session's command lists: per activity, the ITEMS_KEPT full
+    commands (PROGRAMS_KEPT programs) with the most time plus as many with the
+    most tokens; the rest are summed into OTHER_COMMANDS, so a list still adds up
+    to its activity's total."""
+    for section, keep in (("items", ITEMS_KEPT), ("programs", PROGRAMS_KEPT)):
+        _trim(activities.get(section) or {}, keep)
+    return activities
+
+
+def _trim(lists: dict, keep: int):
+    for act, sigs in lists.items():
+        if len(sigs) <= keep:
+            continue
+
+        def tokens(k, sigs=sigs):
+            return sum(v for c in sigs[k]["tokens_by_model"].values() for v in c.values())
+
+        named = [k for k in sigs if k != OTHER_COMMANDS]
+        kept = set(sorted(named, key=lambda k, sigs=sigs: sigs[k]["time_ms"], reverse=True)[:keep])
+        kept |= set(sorted(named, key=tokens, reverse=True)[:keep])
+        out = {k: sigs[k] for k in kept}
+        for k, bucket in sigs.items():
+            if k not in kept:
+                _merge_buckets(out, {OTHER_COMMANDS: bucket})
+        lists[act] = out
 
 
 def _merge_buckets(dst: dict, src: dict):

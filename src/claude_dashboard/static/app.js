@@ -1759,10 +1759,75 @@ function _swatch(act) {
   return `<span style="display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${ACTIVITY_COLORS[act]}"></span>`;
 }
 
+// Per breakdown (element id): fold flag, expanded activities, command grouping and sort.
+const _activityState = {};
+
+function _actState(id) {
+  return (_activityState[id] = _activityState[id] || {
+    fold: false,
+    open: new Set(),
+    group: "program",
+    sort: "time",
+  });
+}
+
+function toggleActivityItems(id, act) {
+  const st = _actState(id);
+  st.open.has(act) ? st.open.delete(act) : st.open.add(act);
+  renderActivityBreakdown(id);
+}
+
+function setActivityItemsView(id, key, value) {
+  _actState(id)[key] = value;
+  renderActivityBreakdown(id);
+}
+
+function _activityItemsHtml(id, act, actTime) {
+  const st = _actState(id);
+  // "program": every command grouped up to its first flag or path (complete);
+  // "full": the heaviest normalised command lines, the rest in "(other commands)".
+  const section = st.group === "program" ? "programs" : "items";
+  const sigs = ((_activityData[id] || {})[section] || {})[act] || {};
+  const groups = {};
+  for (const [key, b] of Object.entries(sigs))
+    groups[key] = { cost: b.cost_usd || 0, time: b.time_ms || 0, calls: b.calls || 0 };
+  const keyOf = { time: "time", cost: "cost", calls: "calls" }[st.sort];
+  const rows = Object.entries(groups)
+    .sort((a, b) => b[1][keyOf] - a[1][keyOf])
+    .slice(0, 25);
+  if (!rows.length)
+    return '<div class="muted" style="padding:8px 4px;font-size:.78rem">No command detail — refresh to re-parse.</div>';
+  const opt = (key, value, label) =>
+    `<button class="seg-opt ${st[key] === value ? "active" : ""}" onclick="event.stopPropagation();setActivityItemsView('${id}','${key}','${value}')">${label}</button>`;
+  const pct = (v) => (actTime ? Math.round((100 * v) / actTime) + "%" : "—");
+  return `<div style="padding:6px 0 10px 18px">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;font-size:.75rem" class="muted">
+      Group <span class="seg-toggle">${opt("group", "program", "Program")}${opt("group", "full", "Full command")}</span>
+      Sort <span class="seg-toggle">${opt("sort", "time", "Time")}${opt("sort", "cost", "Cost")}${opt("sort", "calls", "Calls")}</span>
+    </div>
+    <table style="font-size:.8rem">
+      <thead><tr><th>Command</th><th class="right">Calls</th><th class="right">Est. cost</th>
+        <th class="right">Time</th><th class="right">Avg time</th><th class="right">% of activity time</th></tr></thead>
+      <tbody>${rows
+        .map(
+          ([k, g]) => `<tr>
+        <td class="mono" style="max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(k)}">${esc(k)}</td>
+        <td class="right">${fmt(g.calls)}</td>
+        <td class="right cost">$${fmtCost(g.cost)}</td>
+        <td class="right">${fmtDur(g.time)}</td>
+        <td class="right">${fmtDur(g.calls ? g.time / g.calls : 0)}</td>
+        <td class="right">${pct(g.time)}</td></tr>`,
+        )
+        .join("")}</tbody>
+    </table></div>`;
+}
+
 function renderActivityBreakdown(id, fold) {
+  const st = _actState(id);
+  if (fold !== undefined) st.fold = fold;
   const el = document.getElementById(id);
   if (!el || !_activityData[id]) return;
-  const rows = activityRows(_activityData[id], fold);
+  const rows = activityRows(_activityData[id], st.fold);
   if (!rows.length) {
     el.innerHTML = '<span class="muted">No activity data — refresh to re-parse.</span>';
     return;
@@ -1787,19 +1852,23 @@ function renderActivityBreakdown(id, fold) {
         <th class="right">% cost</th><th class="right">Time</th><th class="right">% time</th>
         <th class="right">API calls</th></tr></thead>
       <tbody>${rows
-        .map(
-          (r) => `<tr>
-        <td>${_swatch(r.act)}${ACTIVITY_LABELS[r.act]}</td>
+        .map((r) => {
+          const open = st.open.has(r.act);
+          const row = `<tr style="cursor:pointer" title="Show the commands" onclick="toggleActivityItems('${id}','${r.act}')">
+        <td><span class="muted" style="display:inline-block;width:12px">${open ? "▾" : "▸"}</span>${_swatch(r.act)}${ACTIVITY_LABELS[r.act]}</td>
         <td class="right">${fmtBig(r.tokens)}</td>
         <td class="right cost">$${fmtCost(r.cost)}</td>
         <td class="right">${pct(r.cost, tot.cost)}</td>
         <td class="right">${fmtDur(r.time)}</td>
         <td class="right">${pct(r.time, tot.time)}</td>
-        <td class="right">${fmt(r.calls)}</td></tr>`,
-        )
+        <td class="right">${fmt(r.calls)}</td></tr>`;
+          return open
+            ? row + `<tr><td colspan="7" style="padding:0">${_activityItemsHtml(id, r.act, r.time)}</td></tr>`
+            : row;
+        })
         .join("")}</tbody>
     </table></div>
-    <div class="muted" style="font-size:.72rem;margin-top:6px">Time is agent-time: generation plus tool runs, summed over the main thread and every subagent (${fmtDur(tot.time)}); waits for you are excluded.</div>`;
+    <div class="muted" style="font-size:.72rem;margin-top:6px">Click an activity for its commands${st.fold ? " (with exploration folded, a row lists only its own commands)" : ""}. Time is agent-time: generation plus tool runs, summed over the main thread and every subagent (${fmtDur(tot.time)}); waits for you are excluded.</div>`;
 }
 
 // Section markup; call renderActivityBreakdown(id, false) once it is in the DOM.

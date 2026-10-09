@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_dashboard.activities import RULES_VERSION, is_review_agent
+from claude_dashboard.activities import RULES_VERSION, is_review_agent, trim_items
 from claude_dashboard.parser import merge_stats, parse_file
 from claude_dashboard.pricing import estimate_cost, rate_revision
 from claude_dashboard.store import Store
@@ -111,9 +111,11 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                 # CLI bills side requests it never writes to the transcript — see the
                 # module docstring in pricing.py.
                 stats["cost_usd"] = estimate_cost(stats.get("tokens_by_model", {}))["total"]
-                acts = stats.get("activities") or {}
+                acts = trim_items(stats.get("activities") or {})
                 sections = [acts.get("by_activity") or {}, acts.get("explore_next") or {},
-                            *(acts.get("by_day") or {}).values()]
+                            *(acts.get("by_day") or {}).values(),
+                            *(acts.get("items") or {}).values(),
+                            *(acts.get("programs") or {}).values()]
                 for section in sections:
                     for bucket in section.values():
                         bucket["cost_usd"] = estimate_cost(bucket["tokens_by_model"])["total"]

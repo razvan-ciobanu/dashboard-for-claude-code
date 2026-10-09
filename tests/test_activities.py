@@ -5,12 +5,16 @@ import json
 
 import pytest
 
+from claude_dashboard import activities
 from claude_dashboard.activities import (
+    OTHER_COMMANDS,
     ActivityTracker,
     classify_bash,
     classify_path,
     classify_tool,
     is_review_agent,
+    signature,
+    trim_items,
 )
 from claude_dashboard.parser import merge_stats, parse_file
 
@@ -338,3 +342,103 @@ def test_local_file_tool_run_time_is_a_permission_wait():
         _result(25_000, "r1-0"),  # approved hours later
     ])
     assert r["by_activity"]["code"]["time_ms"] == 2000
+
+
+@pytest.mark.parametrize("name,inp,want", [
+    ("Bash", {"command": "cd /Users/me/repo/.claude/worktrees/x && uv run pytest tests/test_a.py -x 2>&1 | tail -20"},
+     "pytest tests/test_a.py -x"),
+    ("Bash", {"command": "env -u SSL_CERT_FILE gh run watch 36412627335 --exit-status >/dev/null 2>&1; echo $?"},
+     "gh run watch N --exit-status"),
+    ("Bash", {"command": 'grep -n "a|b" /Users/me/repo/src/x.py | head'}, 'grep -n "a|b" …/x.py'),
+    ("Bash", {"command": "aws batch submit-job --job-name golden-dau-0f1e2d3c"},
+     "aws batch submit-job --job-name golden-dau-N"),
+    ("Bash", {"command": "python3 - <<'EOF'\nimport json\nEOF"}, "python3 - <<inline script"),
+    ("Bash", {"command": "cat > /w/src/mod.py <<'EOF'\nx = 1\nEOF\ncd /w/dp404 && uv run pytest -q"},
+     "pytest -q"),  # a test run, like its activity
+    ("Bash", {"command": "cat > /w/src/mod.py <<'EOF'\nx = 1\nEOF"}, "cat > …/mod.py"),
+    ("Bash", {"command": 'python3 -c "import certifi; print(certifi.where())"'},
+     'python3 -c "import certifi; print(certifi.where())"'),
+    ("Edit", {"file_path": "/a/b/tests/test_x.py"}, "Edit test_x.py"),
+    ("Bash", {"command": "rm -rf /tmp/x && mkdir /tmp/x && uv run pytest -q"}, "pytest -q"),
+    ("mcp__clickhouse__run_query", {}, "clickhouse run_query"),
+    ("Agent", {"subagent_type": "Explore"}, "Agent (Explore)"),
+])
+def test_signature(name, inp, want):
+    assert signature(name, inp) == want
+
+
+def test_items_list_the_commands_of_each_activity():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Read", {"file_path": "a.py"}), ("Bash", {"command": "uv run pytest -q"})]),
+        _result(31, "r1-1"),
+        _call(32, "r2", [("Bash", {"command": "cd /x && uv run pytest -q 2>&1 | tail"})]),
+        _result(62, "r2-0"),
+    ])
+    tests = r["items"]["test"]
+    assert list(tests) == ["pytest -q"]  # the deciding tool, not the Read
+    assert tests["pytest -q"]["calls"] == 2
+    assert tests["pytest -q"]["time_ms"] == r["by_activity"]["test"]["time_ms"]
+
+
+def test_trim_items_keeps_the_heaviest_and_sums_the_rest(monkeypatch):
+    def b(t):
+        return {"tokens_by_model": {"m": {"input": t}}, "time_ms": t, "calls": 1}
+    acts = {"items": {"test": {f"cmd{i}": b(i) for i in range(10)}}}
+    monkeypatch.setattr(activities, "ITEMS_KEPT", 3)
+    trim_items(acts)
+    kept = acts["items"]["test"]
+    assert set(kept) == {"cmd9", "cmd8", "cmd7", OTHER_COMMANDS}
+    assert kept[OTHER_COMMANDS]["calls"] == 7
+    assert sum(x["time_ms"] for x in kept.values()) == sum(range(10))
+
+
+@pytest.mark.parametrize("sig,want", [
+    ("pytest tests/test_a.py -x", "pytest test_a.py"),
+    ('pytest -m "not slow" -q', "pytest"),
+    ("gh run watch N --exit-status", "gh run watch"),
+    ("aws batch submit-job --job-name x", "aws batch submit-job"),
+    ("Edit test_x.py", "Edit *.py"),
+    ("wait → pytest -m slow", "wait → pytest"),
+    ('wait → "$S"/run.sh', 'wait → "$S"/run.sh'),
+    ("cat > …/mod.py", "cat > *.py"),
+    ("(no tool)", "(no tool)"),
+])
+def test_program_of(sig, want):
+    assert activities.program_of(sig) == want
+
+
+def test_task_output_shows_the_background_command():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "uv run pytest -m slow", "run_in_background": True})]),
+        _with_text(_result(2, "r1-0"), "Command running in background with ID: b538xch60."),
+        _call(3, "r2", [("TaskOutput", {"task_id": "b538xch60"})]),
+        _result(303, "r2-0"),
+    ])
+    assert list(r["items"]["test"]) == ["pytest -m slow"]
+    assert r["items"]["test"]["pytest -m slow"]["calls"] == 2
+
+
+def test_wait_is_labelled_with_what_it_waits_on():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "nohup uv run pytest -m slow > /tmp/s/t.log 2>&1 &"})]),
+        _result(2, "r1-0"),
+        _call(3, "r2", [("Bash", {"command": "sleep 600"})]),
+        _result(603, "r2-0"),
+    ])
+    assert set(r["items"]["test"]) == {"pytest -m slow", "wait → pytest -m slow"}
+
+
+def test_wait_labels_do_not_nest():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "uv run pytest -m slow > /tmp/s/t.log 2>&1 &"})]),
+        _result(2, "r1-0"),
+        _call(3, "r2", [("Bash", {"command": "sleep 60", "run_in_background": True})]),
+        _with_text(_result(4, "r2-0"), "Command running in background with ID: bk1."),
+        _call(5, "r3", [("TaskOutput", {"task_id": "bk1"})]),
+        _result(65, "r3-0"),
+    ])
+    assert set(r["items"]["test"]) == {"pytest -m slow", "wait → pytest -m slow"}

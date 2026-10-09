@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from claude_dashboard.activities import OTHER_COMMANDS
 from claude_dashboard.parser import EMPTY_TOKENS
 
 _SCHEMA = """
@@ -347,13 +348,20 @@ class Store:
             rows = [r for r in self._con.execute(
                 "SELECT project_path, activities_json FROM sessions"
             ).fetchall() if r["project_path"] not in hidden]
-        out: dict[str, dict] = {"by_activity": {}, "explore_next": {}, "daily": {}}
+        out: dict[str, dict] = {"by_activity": {}, "explore_next": {}, "daily": {},
+                                "items": {}, "programs": {}}
         for r in rows:
             acts = _loads_obj(r["activities_json"])
             for section in ("by_activity", "explore_next"):
                 _add_flat(out[section], _as_obj(acts.get(section)))
             for day, by_act in _as_obj(acts.get("by_day")).items():
                 _add_flat(out["daily"].setdefault(day, {}), _as_obj(by_act))
+            for section in ("items", "programs"):
+                for act, sigs in _as_obj(acts.get(section)).items():
+                    _add_flat(out[section].setdefault(act, {}), _as_obj(sigs))
+        for section in ("items", "programs"):
+            for act, sigs in out[section].items():
+                out[section][act] = _top_items(sigs, keep=300 if section == "programs" else 100)
         return out
 
     def list_sessions_for_paths(self, project_paths: list[str]) -> list[dict]:
@@ -561,6 +569,21 @@ def _num(v: Any) -> float:
     valid object should not raise mid-aggregation.
     """
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def _top_items(sigs: dict, keep: int = 100) -> dict:
+    """The `keep` commands with the most time plus the `keep` costliest; the rest
+    summed into OTHER_COMMANDS."""
+    named = [k for k in sigs if k != OTHER_COMMANDS]
+    kept = set(sorted(named, key=lambda k: sigs[k]["time_ms"], reverse=True)[:keep])
+    kept |= set(sorted(named, key=lambda k: sigs[k]["cost_usd"], reverse=True)[:keep])
+    out = {k: sigs[k] for k in kept}
+    for k, b in sigs.items():
+        if k not in kept:
+            d = out.setdefault(OTHER_COMMANDS, {"tokens": 0, "cost_usd": 0.0, "time_ms": 0, "calls": 0})
+            for f in d:
+                d[f] += b[f]
+    return out
 
 
 def _add_flat(dst: dict, src: dict):
