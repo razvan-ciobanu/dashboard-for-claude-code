@@ -1672,6 +1672,10 @@ const ACTIVITY_LABELS = {
   eval: "Evaluation",
   train: "Training",
   review: "Review",
+  build: "Build / release",
+  git: "Git / PRs",
+  ops: "Infra / ops",
+  coord: "Coordination",
   explore: "Exploration",
   other: "Other",
 };
@@ -1682,6 +1686,10 @@ const ACTIVITY_COLORS = {
   eval: "#d4a017",
   train: "#e07b39",
   review: "var(--blue)",
+  build: "#8b5a2b",
+  git: "#2bb3a3",
+  ops: "#c2569b",
+  coord: "#6c8ebf",
   explore: "var(--gray-300)",
   other: "var(--red)",
 };

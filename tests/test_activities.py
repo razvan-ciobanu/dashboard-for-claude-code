@@ -42,8 +42,18 @@ def test_classify_path(path, want):
     ("ls > /dev/null", "explore"),
     ("python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF", "explore"),
     ("python3 - <<'EOF'\nimport pathlib\npathlib.Path('tests/test_a.py').write_text('x')\nEOF", "test"),
-    ("git commit -m 'x' && git push", "other"),
-    ("git worktree add ../wt -b me/DP-1-test-hygiene", "other"),
+    ("git commit -m 'x' && git push", "git"),
+    ("git worktree add ../wt -b me/DP-1-test-hygiene", "git"),
+    ("gh pr create --base main --fill", "git"),
+    ("git tag forecasting-v0.8.0 && git push origin forecasting-v0.8.0", "build"),
+    ("gh workflow run docker-build-push.yml --ref main", "build"),
+    ("docker build -t img . && docker push img", "build"),
+    ("uv sync --all-groups", "build"),
+    ("sbt -batch compile", "build"),
+    ("ssh -o BatchMode=yes host 'systemctl is-active grafana'", "ops"),
+    ("aws iam put-role-policy --role-name r --policy-document file://p.json", "ops"),
+    ("terraform apply -target=module.x", "ops"),
+    ("for i in $(seq 1 45); do gh run list --workflow docker-build-push --limit 1; sleep 20; done", "wait"),
     ("nohup uv run python scripts/validation/run_attribution.py --max-folds 4 > /tmp/a.log 2>&1 &", "eval"),
     ("uv run python scripts/training/ecpm_grid_search.py --round r3 > run.log", "train"),
     ("uv run python batch_run.py --name golden-dau --tag x", "test"),
@@ -63,8 +73,11 @@ def test_classify_tool():
     assert classify_tool("Write", {"file_path": "docs/a.md"}) == "docs"
     assert classify_tool("Read", {"file_path": "src/a.py"}) == "explore"
     assert classify_tool("mcp__jira__jira_get_issue", {}) == "explore"
-    assert classify_tool("mcp__jira__jira_create_issue", {}) == "other"
-    assert classify_tool("Agent", {}) == "other"
+    assert classify_tool("mcp__jira__jira_create_issue", {}) == "coord"
+    assert classify_tool("Agent", {}) == "coord"
+    assert classify_tool("SendMessage", {}) == "coord"
+    assert classify_tool("EnterWorktree", {}) == "git"
+    assert classify_tool("AskUserQuestion", {}) == "other"
 
 
 def test_is_review_agent():
@@ -149,7 +162,7 @@ def test_tracker_skips_foreground_agent_wait():
         _call(1, "r1", [("Agent", {"description": "Implement x"})]),
         _result(901, "r1-0"),  # 15 min of subagent work, timed in its own file
     ])
-    assert r["by_activity"]["other"]["time_ms"] == 1000
+    assert r["by_activity"]["coord"]["time_ms"] == 1000
 
 
 def test_review_agent_is_all_review():
@@ -187,7 +200,8 @@ def test_wait_takes_the_activity_of_the_run_it_waits_on():
     ("gh run watch 36412627335 --exit-status --interval 30", "test"),
     ("timeout 590 bash -c 'while ! grep -qE \"[0-9]+ (passed|failed)\" /tmp/x; do sleep 10; done'", "test"),
     ("until grep -q 'eval_revenue_torch exit' /tmp/j.txt; do sleep 60; done", "eval"),
-    ("until [ -s /tmp/unknown.txt ]; do sleep 5; done", "other"),
+    ("until [ -s /tmp/unknown.txt ]; do sleep 5; done", "other"),  # nothing launched before
+    ("for i in $(seq 1 45); do gh run list --workflow docker-build-push --limit 1; sleep 20; done", "build"),
 ])
 def test_unlinked_wait_uses_its_own_words(cmd, want):
     r = _run([_prompt(0), _call(1, "r1", [("Bash", {"command": cmd})])])
@@ -235,5 +249,54 @@ def test_wait_on_a_batch_job_id():
             "while aws batch describe-jobs --jobs 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
             " | grep -q RUNNING; do sleep 60; done")})]),
         _result(3603, "r2-0"),
+    ])
+    assert set(r["by_activity"]) == {"train"}
+
+
+def _with_text(line, text):
+    line["message"]["content"][0]["content"] = text
+    return line
+
+
+def test_task_output_waits_on_the_background_task_it_names():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "uv run pytest -m slow", "run_in_background": True})]),
+        _with_text(_result(2, "r1-0"), "Command running in background with ID: b538xch60. Output ..."),
+        _call(3, "r2", [("TaskOutput", {"task_id": "b538xch60", "block": True})]),
+        _result(303, "r2-0"),
+    ])
+    assert set(r["by_activity"]) == {"test"}
+    assert r["by_activity"]["test"]["time_ms"] == 303000
+
+
+def test_task_output_on_a_subagent_is_not_timed():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Agent", {"description": "Implement x", "run_in_background": True})]),
+        _with_text(_result(2, "r1-0"), "Async agent launched. agentId: a0277fda9ca31919d"),
+        _call(3, "r2", [("TaskOutput", {"task_id": "a0277fda9ca31919d"})]),
+        _result(1803, "r2-0"),  # 30 min of subagent work, timed in its own file
+    ])
+    assert set(r["by_activity"]) == {"coord"}
+    assert r["by_activity"]["coord"]["time_ms"] == 1000 + 1000
+
+
+def test_mcp_login_is_not_timed():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("mcp__claude_ai_Atlassian__authenticate", {})]),
+        _result(7201, "r1-0"),  # two hours until the OAuth login finished
+    ])
+    assert r["by_activity"]["other"]["time_ms"] == 1000
+
+
+def test_bare_timer_waits_on_the_latest_run():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "aws batch submit-job --job-name grid-search-ecpm"})]),
+        _result(2, "r1-0"),
+        _call(3, "r2", [("Bash", {"command": "sleep 600"})]),
+        _result(603, "r2-0"),
     ])
     assert set(r["by_activity"]) == {"train"}

@@ -11,7 +11,9 @@ activity came next in the same turn (`explore_next`), so the UI can show the
 reading either as its own activity or folded into the work it led to.
 
 A run (script, container, batch job) is test / eval / train by the words of what
-it runs; a wait (polling loop, Monitor, `gh run watch`) takes the activity of the
+it runs; other commands fall into build (docker build/push, tags, releases,
+dependency installs), git (commits, PRs, worktrees), ops (ssh, aws, terraform,
+...) or coord (agents, messages, task tracking, Jira); a wait (polling loop, Monitor, `gh run watch`) takes the activity of the
 run it waits on — see `ActivityTracker._resolve_wait`. AskUserQuestion and
 foreground Agent waits are not timed.
 
@@ -25,12 +27,18 @@ from datetime import datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "3"
+RULES_VERSION = "7"
 
-ACTIVITIES = ("code", "docs", "test", "eval", "train", "review", "explore", "other")
+ACTIVITIES = (
+    "code", "docs", "test", "eval", "train", "review",
+    "build", "git", "ops", "coord", "explore", "other",
+)
 
 # Highest first: a call that both reads and edits code is `code`.
-_PRIORITY = {"test": 0, "train": 1, "eval": 2, "code": 3, "docs": 4, "other": 5, "explore": 6}
+_PRIORITY = {
+    "test": 0, "train": 1, "eval": 2, "code": 3, "docs": 4,
+    "build": 5, "git": 6, "ops": 7, "coord": 8, "other": 9, "explore": 10,
+}
 
 _EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 _READ_TOOLS = {"Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch", "ToolSearch"}
@@ -46,15 +54,34 @@ _TEST_CMD = re.compile(
 )
 # A shell write into a file: `> path`, `>> path`, `tee [-a] path`.
 _SHELL_WRITE = re.compile(r"(?:>>?|\btee\s+(?:-a\s+)?)\s*['\"]?([~${}\w./-]+\.\w+)")
-_RUN_ACTS = {"test", "eval", "train"}
+_RUN_ACTS = {"test", "eval", "train", "build"}
+# Orchestrating other agents and tracking the work (agents, messages, tasks, Jira).
+_COORD_TOOLS = {
+    "Agent", "SendMessage", "SubagentHandback", "TaskStop", "ListAgents", "TodoWrite",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "CronCreate", "CronDelete",
+    "ScheduleWakeup", "PushNotification",
+}
+_GIT_TOOLS = {"EnterWorktree", "ExitWorktree"}
+_COORD_MCP = re.compile(r"^mcp__(jira|atlassian|linear|todoist|monday|plugin_slack\w*)__", re.IGNORECASE)
+_BUILD_WORDS = re.compile(r"(?<![a-z])(build|release|publish|deploy|docker-build\w*)(?![a-z])")
+_OPS_HEADS = {
+    "ssh", "scp", "rsync", "terraform", "ansible", "ansible-playbook", "aws", "gcloud",
+    "kubectl", "helm", "systemctl", "journalctl", "sudo",
+}
+_BUILD_HEADS = {"sbt", "mvn", "gradle", "cargo", "go", "npm", "pnpm", "yarn", "pip", "pip3", "poetry"}
 _UNTIMED_TOOLS = {"Agent", "AskUserQuestion", "ExitPlanMode", "SubagentHandback"}
+# MCP OAuth flows: the result arrives when the person finishes logging in.
+_AUTH_TOOLS = ("__authenticate", "__complete_authentication")
 _PATH_TOKEN = re.compile(r"[~\w.-]*/[\w./-]*[\w-]\.\w+")
+# How a tool result names the background task it started (bash, MCP call, agent).
+_TASK_ID = re.compile(r"(?:with ID:|as task|agentId:)\s*([A-Za-z0-9]+)")
 _JOB_ID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 _LOG_EXT = (".log", ".out", ".err")
 # Commands that wait on something else: polling loops, CI/batch watchers, sleeps.
 _WAIT = re.compile(
     r"\b(until|while)\b[^\n]*\b(do|sleep)\b|\bgh\s+run\s+watch\b|\bgh\s+pr\s+checks\b[^\n]*--watch"
     r"|\baws\s+batch\s+wait\b|^\s*sleep\s+\d|\btimeout\s+\d+\s+(ba|z)?sh\s+-c\b"
+    r"|(?s:\bfor\b.*\bdo\b.*\bsleep\s+\d)"
 )
 _CI_WAIT = re.compile(r"\bgh\s+(run\s+watch|pr\s+checks)\b")
 _RUNNERS = {"docker", "podman", "bash", "sh", "zsh", "make", "node", "npx", "sbatch", "kubectl"}
@@ -118,8 +145,9 @@ def classify_bash(command: str) -> str:
     words = [_strip_wrappers(p.split()) for p in parts]
     # A run (script, container, batch job): what it runs decides.
     runs = [p for p, w in zip(parts, words) if w and _is_run(w)]
-    if runs:
-        return next((a for a in map(classify_run, runs) if a), "other")
+    act = next((a for a in map(classify_run, runs) if a), None)
+    if act:
+        return act
     # A heredoc script that writes a file (python - <<EOF ... write_text ...).
     for body in bodies:
         if _PY_WRITE.search(body):
@@ -132,6 +160,30 @@ def classify_bash(command: str) -> str:
     bare_parts = [p.strip() for p in re.split(r"\|\||&&|[|;\n()]", bare) if p.strip()]
     if bare_parts and all(_is_read_cmd(p, bool(bodies)) for p in bare_parts):
         return "explore"
+    # Otherwise the most significant kind of tooling the non-reading parts use.
+    acts = [_tool_kind(w) for p in bare_parts
+            if (w := _strip_wrappers(p.split())) and not _is_read_cmd(p, bool(bodies))]
+    return min(acts, key=_PRIORITY.__getitem__, default="other")
+
+
+def _tool_kind(words: list[str]) -> str:
+    """build / git / ops for one non-reading command, else other."""
+    head = words[0].rsplit("/", 1)[-1]
+    rest = [w for w in words[1:] if not w.startswith("-")]
+    if head == "git":
+        return "build" if rest[:1] == ["tag"] else "git"
+    if head == "gh":
+        if rest[:1] in (["release"], ["workflow"]):
+            return "build"
+        return "git" if rest[:1] in (["pr"], ["repo"], ["issue"]) else "ops"
+    if head in {"docker", "podman"}:
+        return "build" if rest[:1] in (["build"], ["push"], ["buildx"], ["compose"]) else "ops"
+    if head == "uv":
+        return "build" if rest[:1] in (["sync"], ["build"], ["publish"], ["lock"], ["add"], ["pip"]) else "other"
+    if head in _BUILD_HEADS:
+        return "build"
+    if head in _OPS_HEADS:
+        return "ops"
     return "other"
 
 
@@ -195,6 +247,10 @@ def classify_tool(name: str, inp: dict) -> str:
         return "explore"
     if name.startswith("mcp__") and _READ_MCP.search(name.rsplit("__", 1)[-1]):
         return "explore"
+    if name in _COORD_TOOLS or _COORD_MCP.match(name):
+        return "coord"
+    if name in _GIT_TOOLS:
+        return "git"
     return "other"
 
 
@@ -225,6 +281,9 @@ class ActivityTracker:
         self.tool_owner: dict[str, tuple[str, str, str]] = {}  # tool_use id -> (requestId, tool, act)
         self.turn = 0                       # bumped at every user/notification boundary
         self.last_ms: float | None = None
+        self.task_acts: dict[str, str] = {}  # background task id -> act ("agent" for a subagent)
+        self.untimed: set[str] = set()       # tool_use ids whose run time is not ours
+        self.last_run: str | None = None     # activity of the latest test/eval/train/build run
         self.run_paths: dict[str, str] = {}  # path / job id named by a test/eval/train run -> act
 
     def feed(self, line: dict):
@@ -257,28 +316,43 @@ class ActivityTracker:
         call["usage"] = msg.get("usage") or call["usage"]  # last line wins
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                act = self._classify(block.get("name", ""), block.get("input") or {})
+                name, inp = block.get("name", ""), block.get("input") or {}
+                act = self._classify(name, inp)
+                if name == "TaskOutput":
+                    # Waiting on a background task: it is that task's work. A
+                    # subagent's work is timed in its own transcript.
+                    act = self.task_acts.get(str(inp.get("task_id")), "other")
+                    if act == "agent":
+                        act = "coord"
+                        self.untimed.add(block.get("id"))
                 call["tools"].append(act)
                 if block.get("id"):
                     self.tool_owner[block["id"]] = (rid, block.get("name", ""), act)
 
     def _user(self, line: dict, now: float | None):
         content = (line.get("message") or {}).get("content")
-        owner = None
+        owner, owner_id = None, None
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     found = self.tool_owner.get(block.get("tool_use_id"))
+                    if found:
+                        text = str(block.get("content"))[:4000]
+                        for tid in _TASK_ID.findall(text):
+                            self.task_acts[tid] = "agent" if found[1] == "Agent" else found[2]
                     if found and found[2] in _RUN_ACTS:
                         # A run's result names where it writes / what it started
                         # (background output file, batch job id) — waits poll those.
                         self._remember(str(block.get("content"))[:4000], found[2])
-                    owner = owner or found
+                    if found and not owner:
+                        owner, owner_id = found, block.get("tool_use_id")
         if owner:
             rid, tool, _ = owner
+            if owner_id in self.untimed:
+                tool = "Agent"
             # Tool run time — except a foreground Agent (the subagent times its own
             # work) and tools whose result is a person's answer (user wait).
-            if tool not in _UNTIMED_TOOLS:
+            if tool not in _UNTIMED_TOOLS and not tool.endswith(_AUTH_TOOLS):
                 self.calls[rid]["time_ms"] += self._gap(now)
         else:
             self.turn += 1  # user prompt / notification: the wait before it is nobody's
@@ -288,8 +362,10 @@ class ActivityTracker:
     def _classify(self, name: str, inp: dict) -> str:
         cmd = inp.get("command") or ""
         act = "wait" if name == "Monitor" else classify_tool(name, inp)
-        if act in _RUN_ACTS and cmd:
-            self._remember(_HEREDOC.sub(" ", cmd), act)
+        if act in _RUN_ACTS:
+            self.last_run = act
+            if cmd:
+                self._remember(_HEREDOC.sub(" ", cmd), act)
         if act == "wait":
             act = self._resolve_wait(cmd)
         return act
@@ -300,16 +376,20 @@ class ActivityTracker:
 
     def _resolve_wait(self, cmd: str) -> str:
         """A wait belongs to what it waits on: a run whose log/output path it
-        names (latest wins), else the words of the wait itself, else CI = test."""
+        names (latest wins), else the words of the wait itself, else CI = test,
+        else the latest run of this thread."""
         hits = [act for path, act in self.run_paths.items() if path in cmd]
         if hits:
             return hits[-1]
         act = classify_run(_QUOTED.sub(lambda m: m.group(0).replace("/", " "), cmd))
         if act:
             return act
+        if _BUILD_WORDS.search(cmd.lower()):
+            return "build"
         if _CI_WAIT.search(cmd) or _TEST_OUTCOME.search(cmd):
             return "test"
-        return "other"
+        # A bare timer (`sleep 600`, then check) waits on whatever was last launched.
+        return self.last_run or "other"
 
     def _activity(self, call: dict) -> str:
         if self.review:
