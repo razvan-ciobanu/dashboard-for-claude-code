@@ -1660,6 +1660,112 @@ function renderSessionRow(s) {
   </tr>`;
 }
 
+// ── Activity breakdown (session modal) ─────────────────────────────────────
+// Tokens / cost / time per activity, from `s.activities` (see activities.py).
+// "Fold exploration" moves each exploring call into the activity that followed
+// it in the same turn (explore_next); exploration ending a turn lands in Other.
+
+const ACTIVITY_LABELS = {
+  code: "Writing code",
+  docs: "Docs / decisions",
+  test: "Testing",
+  review: "Review",
+  explore: "Exploration",
+  other: "Other",
+};
+const ACTIVITY_COLORS = {
+  code: "var(--accent)",
+  docs: "var(--purple)",
+  test: "var(--green)",
+  review: "var(--blue)",
+  explore: "var(--gray-300)",
+  other: "var(--red)",
+};
+let _activitySession = null;
+
+function _bucketTokens(b) {
+  return Object.values(b.tokens_by_model || {}).reduce(
+    (sum, t) =>
+      sum +
+      (t.input || 0) +
+      (t.output || 0) +
+      (t.cache_read || 0) +
+      (t.cache_write_5m || 0) +
+      (t.cache_write_1h || 0),
+    0,
+  );
+}
+
+function activityRows(acts, fold) {
+  const rows = {};
+  const add = (act, b) => {
+    const r = (rows[act] = rows[act] || { tokens: 0, cost: 0, time: 0, calls: 0 });
+    r.tokens += _bucketTokens(b);
+    r.cost += b.cost_usd || 0;
+    r.time += b.time_ms || 0;
+    r.calls += b.calls || 0;
+  };
+  for (const [act, b] of Object.entries(acts.by_activity || {}))
+    if (!(fold && act === "explore")) add(act, b);
+  if (fold)
+    for (const [act, b] of Object.entries(acts.explore_next || {})) add(act, b);
+  return Object.keys(ACTIVITY_LABELS)
+    .filter((a) => rows[a])
+    .map((a) => ({ act: a, ...rows[a] }));
+}
+
+function renderActivityBreakdown(fold) {
+  const el = document.getElementById("activity-breakdown");
+  if (!el || !_activitySession) return;
+  const rows = activityRows(_activitySession.activities || {}, fold);
+  if (!rows.length) {
+    el.innerHTML = '<span class="muted">No activity data — refresh to re-parse.</span>';
+    return;
+  }
+  const tot = rows.reduce(
+    (t, r) => ({ cost: t.cost + r.cost, time: t.time + r.time, tokens: t.tokens + r.tokens }),
+    { cost: 0, time: 0, tokens: 0 },
+  );
+  const pct = (v, t) => (t ? Math.round((100 * v) / t) + "%" : "—");
+  const bar = (key) =>
+    `<div style="display:flex;height:10px;border-radius:5px;overflow:hidden;margin:4px 0 10px">${rows
+      .map(
+        (r) =>
+          `<div title="${ACTIVITY_LABELS[r.act]} ${pct(r[key], tot[key])}" style="width:${tot[key] ? (100 * r[key]) / tot[key] : 0}%;background:${ACTIVITY_COLORS[r.act]}"></div>`,
+      )
+      .join("")}</div>`;
+  el.innerHTML = `
+    <div class="muted" style="font-size:.75rem">Cost</div>${bar("cost")}
+    <div class="muted" style="font-size:.75rem">Time</div>${bar("time")}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Activity</th><th class="right">Tokens</th><th class="right">Est. cost</th>
+        <th class="right">% cost</th><th class="right">Time</th><th class="right">% time</th>
+        <th class="right">API calls</th></tr></thead>
+      <tbody>${rows
+        .map(
+          (r) => `<tr>
+        <td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${ACTIVITY_COLORS[r.act]}"></span>${ACTIVITY_LABELS[r.act]}</td>
+        <td class="right">${fmtBig(r.tokens)}</td>
+        <td class="right cost">$${fmtCost(r.cost)}</td>
+        <td class="right">${pct(r.cost, tot.cost)}</td>
+        <td class="right">${fmtDur(r.time)}</td>
+        <td class="right">${pct(r.time, tot.time)}</td>
+        <td class="right">${fmt(r.calls)}</td></tr>`,
+        )
+        .join("")}</tbody>
+    </table></div>
+    <div class="muted" style="font-size:.72rem;margin-top:6px">Time is agent-time: generation plus tool runs, summed over the main thread and every subagent (${fmtDur(tot.time)}); waits for you are excluded.</div>`;
+}
+
+function activitySectionHtml(s) {
+  _activitySession = s;
+  return `<div class="section-title" style="display:flex;align-items:center;gap:12px">Activity Breakdown
+      <label class="muted" style="font-size:.75rem;font-weight:normal;margin-left:auto;cursor:pointer">
+        <input type="checkbox" onchange="renderActivityBreakdown(this.checked)"> Fold exploration into the next action
+      </label></div>
+    <div id="activity-breakdown"></div>`;
+}
+
 // ── Session modal ──────────────────────────────────────────────────────────
 
 function _sessionModalKey(e) {
@@ -1678,6 +1784,7 @@ async function openSessionModal(sessionId) {
         : "/api/sessions/" + sessionId,
     );
     document.getElementById("modalContent").innerHTML = buildSessionModal(s);
+    renderActivityBreakdown(false);
   } catch (e) {
     document.getElementById("modalContent").innerHTML =
       `<p class="muted">Error: ${e.message}</p>`;
@@ -1828,6 +1935,7 @@ function buildSessionModal(s) {
     </div>
     <div class="section-title">Activity &amp; Reliability</div>
     ${statGrid}
+    ${activitySectionHtml(s)}
     <div class="section-title">Tokens &amp; Est. API Cost by Model</div>
     ${modelRows}${costSummary}
     <div class="section-title">Tool Usage</div>

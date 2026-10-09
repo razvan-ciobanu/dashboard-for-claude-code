@@ -1,0 +1,161 @@
+"""Tests for activities.py — per-session split of tokens and time by activity."""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from claude_dashboard.activities import (
+    ActivityTracker,
+    classify_bash,
+    classify_path,
+    classify_tool,
+    is_review_agent,
+)
+from claude_dashboard.parser import merge_stats, parse_file
+
+
+@pytest.mark.parametrize("path,want", [
+    ("src/app/main.py", "code"),
+    ("config/pipeline.yaml", "code"),
+    ("tests/test_store.py", "test"),
+    ("pkg/test_utils.py", "test"),
+    ("web/button.spec.ts", "test"),
+    ("README.md", "docs"),
+    ("openspec/changes/x/tasks.md", "docs"),
+    ("docs/diagram.svg", "docs"),
+])
+def test_classify_path(path, want):
+    assert classify_path(path) == want
+
+
+@pytest.mark.parametrize("cmd,want", [
+    ("uv run pytest -m 'not slow'", "test"),
+    ("npm run test", "test"),
+    ('grep -n "^A\\|^B" src/x.py | head -5', "explore"),
+    ("cd /repo && git -C sub log --oneline -3 && sed -n 1,20p a.py", "explore"),
+    ("env -u SSL_CERT_FILE gh pr view 65 --json state", "explore"),
+    ("aws batch describe-jobs --jobs 1", "explore"),
+    ("cat > notes/plan.md <<'EOF'\nhello\nEOF", "docs"),
+    ("echo x >> src/mod.py", "code"),
+    ("ls > /dev/null", "explore"),
+    ("python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF", "explore"),
+    ("python3 - <<'EOF'\nimport pathlib\npathlib.Path('tests/test_a.py').write_text('x')\nEOF", "test"),
+    ("git commit -m 'x' && git push", "other"),
+    ("sed -i '' 's/a/b/' src/x.py", "other"),
+])
+def test_classify_bash(cmd, want):
+    assert classify_bash(cmd) == want
+
+
+def test_classify_tool():
+    assert classify_tool("Edit", {"file_path": "src/a.py"}) == "code"
+    assert classify_tool("Write", {"file_path": "docs/a.md"}) == "docs"
+    assert classify_tool("Read", {"file_path": "src/a.py"}) == "explore"
+    assert classify_tool("mcp__jira__jira_get_issue", {}) == "explore"
+    assert classify_tool("mcp__jira__jira_create_issue", {}) == "other"
+    assert classify_tool("Agent", {}) == "other"
+
+
+def test_is_review_agent():
+    assert is_review_agent("Review PR #101")
+    assert is_review_agent("Delta review of commit")
+    assert not is_review_agent("Implement task 3.7")
+    assert not is_review_agent(None)
+
+
+# ── tracker ────────────────────────────────────────────────────────────────
+
+def _ts(sec: int) -> str:
+    return f"2026-01-01T00:{sec // 60:02d}:{sec % 60:02d}.000Z"
+
+
+def _prompt(sec, text="go"):
+    return {"type": "user", "timestamp": _ts(sec), "promptId": "p",
+            "message": {"role": "user", "content": text}}
+
+
+def _call(sec, rid, tools=(), out=10, cache_read=100):
+    content = [{"type": "tool_use", "id": f"{rid}-{i}", "name": n, "input": inp}
+               for i, (n, inp) in enumerate(tools)] or [{"type": "text", "text": "ok"}]
+    return {"type": "assistant", "timestamp": _ts(sec), "requestId": rid,
+            "message": {"model": "claude-sonnet-4-5", "content": content,
+                        "usage": {"input_tokens": 1, "output_tokens": out,
+                                  "cache_read_input_tokens": cache_read}}}
+
+
+def _result(sec, tool_id):
+    return {"type": "user", "timestamp": _ts(sec),
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}}
+
+
+def _run(lines, review=False):
+    t = ActivityTracker(review=review)
+    for line in lines:
+        t.feed(line)
+    return t.result()
+
+
+def _tok(bucket):
+    return sum(sum(v.values()) for v in bucket["tokens_by_model"].values())
+
+
+def test_tracker_attributes_tokens_and_time():
+    r = _run([
+        _prompt(0),
+        _call(3, "r1", [("Read", {"file_path": "a.py"})]),        # 3s generating
+        _result(5, "r1-0"),                                       # 2s reading
+        _call(9, "r2", [("Edit", {"file_path": "a.py"})]),        # 4s generating
+        _result(10, "r2-0"),                                      # 1s editing
+        _call(12, "r3", [("Bash", {"command": "pytest -q"})]),    # 2s
+        _result(42, "r3-0"),                                      # 30s tests
+        _call(44, "r4"),                                          # 2s final answer
+        _prompt(600),                                             # user idle: not counted
+        _call(601, "r5"),
+    ])
+    by = r["by_activity"]
+    assert by["explore"]["time_ms"] == 5000 + 2000 + 1000
+    assert by["code"]["time_ms"] == 5000
+    assert by["test"]["time_ms"] == 32000
+    assert by["explore"]["calls"] == 3
+    assert _tok(by["code"]) == 111
+    # r1 led to code; r4 and r5 ended their turns without an action.
+    assert r["explore_next"]["code"]["calls"] == 1
+    assert r["explore_next"]["other"]["calls"] == 2
+
+
+def test_tracker_dedupes_streamed_lines_last_wins():
+    first = _call(1, "r1", [("Edit", {"file_path": "a.py"})], out=1)
+    last = _call(2, "r1", out=50)  # same requestId, final usage
+    r = _run([_prompt(0), first, last])
+    assert r["by_activity"]["code"]["calls"] == 1
+    assert _tok(r["by_activity"]["code"]) == 1 + 50 + 100
+
+
+def test_tracker_skips_foreground_agent_wait():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Agent", {"description": "Implement x"})]),
+        _result(901, "r1-0"),  # 15 min of subagent work, timed in its own file
+    ])
+    assert r["by_activity"]["other"]["time_ms"] == 1000
+
+
+def test_review_agent_is_all_review():
+    r = _run([_prompt(0), _call(1, "r1", [("Edit", {"file_path": "a.py"})])], review=True)
+    assert set(r["by_activity"]) == {"review"}
+
+
+def test_parse_and_merge_carry_activities(tmp_path):
+    main = tmp_path / "s.jsonl"
+    sub = tmp_path / "agent.jsonl"
+    main.write_text("\n".join(json.dumps(x) for x in [
+        _prompt(0), _call(2, "r1", [("Edit", {"file_path": "a.py"})])]))
+    sub.write_text("\n".join(json.dumps(x) for x in [
+        _prompt(0), _call(4, "s1", [("Read", {"file_path": "a.py"})])]))
+    stats = parse_file(main)
+    merge_stats(stats, parse_file(sub, review=True))
+    by = stats["activities"]["by_activity"]
+    assert by["code"]["time_ms"] == 2000
+    assert by["review"]["time_ms"] == 4000

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     skills_json         TEXT,
     tokens_json         TEXT,
     tools_json          TEXT,
+    activities_json     TEXT,
     cost_usd            REAL
 );
 
@@ -106,6 +107,7 @@ class Store:
             "bash_count": "INTEGER", "bash_interrupted": "INTEGER",
             "git_operations": "INTEGER", "tasks_completed": "INTEGER",
             "permission_modes_json": "TEXT", "skills_json": "TEXT",
+            "activities_json": "TEXT",
         }
         added = False
         for name, typ in wanted.items():
@@ -233,8 +235,8 @@ class Store:
                 tool_errors, user_rejections, bash_count, bash_interrupted,
                 git_operations, tasks_completed,
                 permission_modes_json, skills_json,
-                tokens_json, tools_json, cost_usd)
-               VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?)
+                tokens_json, tools_json, activities_json, cost_usd)
+               VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  project_path=excluded.project_path,
                  project_name=excluded.project_name,
@@ -263,6 +265,7 @@ class Store:
                  skills_json=excluded.skills_json,
                  tokens_json=excluded.tokens_json,
                  tools_json=excluded.tools_json,
+                 activities_json=excluded.activities_json,
                  cost_usd=excluded.cost_usd""",
             (
                 s["session_id"], s.get("project_path"), s.get("project_name"),
@@ -282,6 +285,7 @@ class Store:
                 json.dumps(s.get("skills_used", {})),
                 json.dumps(s.get("tokens_by_model", {})),
                 json.dumps(s.get("tools", {})),
+                json.dumps(s.get("activities", {})),
                 s.get("cost_usd", 0.0),
             ),
         )
@@ -540,6 +544,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "skills_json": "skills_used",
         "branches_json": "branches",
         "activity_json": "activity",
+        "activities_json": "activities",
     }
     for key, out_key in json_cols.items():
         if key in d:

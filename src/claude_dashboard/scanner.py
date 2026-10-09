@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_dashboard.activities import is_review_agent
 from claude_dashboard.parser import merge_stats, parse_file
 from claude_dashboard.pricing import estimate_cost, rate_revision
 from claude_dashboard.store import Store
@@ -88,7 +90,7 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                 # Merge subagent stats
                 for sub_path in subagent_paths:
                     try:
-                        sub_stats = parse_file(sub_path)
+                        sub_stats = parse_file(sub_path, review=is_review_agent(_agent_description(sub_path)))
                         merge_stats(stats, sub_stats)
                         sub_stat = os.stat(sub_path)
                         store.upsert_file(
@@ -106,6 +108,9 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                 # CLI bills side requests it never writes to the transcript — see the
                 # module docstring in pricing.py.
                 stats["cost_usd"] = estimate_cost(stats.get("tokens_by_model", {}))["total"]
+                for section in (stats.get("activities") or {}).values():
+                    for bucket in section.values():
+                        bucket["cost_usd"] = estimate_cost(bucket["tokens_by_model"])["total"]
 
                 store.upsert_session(stats)
                 store.upsert_file(str(jsonl_path), stats["session_id"], mtime, size)
@@ -155,6 +160,15 @@ def _find_subagents(session_jsonl: Path) -> list[Path]:
                 if f.is_file():
                     results.append(f)
     return results
+
+
+def _agent_description(sub_path: Path) -> str | None:
+    """The `description` the parent gave this subagent, from its .meta.json."""
+    meta = sub_path.with_suffix(".meta.json")
+    try:
+        return json.loads(meta.read_text()).get("description")
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _subagents_changed(store: Store, paths: list[Path]) -> bool:

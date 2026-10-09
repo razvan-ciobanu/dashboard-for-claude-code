@@ -5,11 +5,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from claude_dashboard.activities import ActivityTracker, merge_activities
 
-def parse_file(path: str | Path) -> dict[str, Any]:
+
+def parse_file(path: str | Path, review: bool = False) -> dict[str, Any]:
     """
     Stream a session .jsonl file line-by-line and return a SessionStats dict.
-    Never loads the entire file into memory.
+    Never loads the entire file into memory. `review` marks a review subagent
+    transcript: all of its work is attributed to the `review` activity.
     """
     stats: dict[str, Any] = {
         "session_id": None,
@@ -56,6 +59,7 @@ def parse_file(path: str | Path) -> dict[str, Any]:
     # requestId -> last-seen usage/tools for that API call; local so it never leaks
     # into the returned stats (and from there into the DB row).
     req_prev: dict[str, dict] = {}
+    tracker = ActivityTracker(review=review)
 
     with open(path, encoding="utf-8", errors="replace") as fh:
         for raw in fh:
@@ -68,6 +72,7 @@ def parse_file(path: str | Path) -> dict[str, Any]:
                 continue
 
             ltype = line.get("type")
+            tracker.feed(line)
 
             # Track timestamps from any line that carries one. The isinstance
             # guard matters: a non-string timestamp (a number, say) would make
@@ -124,6 +129,7 @@ def parse_file(path: str | Path) -> dict[str, Any]:
                 _handle_attachment(line, stats)
 
     _derive_primary_branch(stats)
+    stats["activities"] = tracker.result()
 
     stats["started_at"] = first_ts
     stats["ended_at"] = last_ts
@@ -355,6 +361,8 @@ def merge_stats(base: dict, extra: dict) -> dict:
         t = base["tokens_by_model"].setdefault(model, dict(EMPTY_TOKENS))
         for k, v in counts.items():
             t[k] = t.get(k, 0) + (v or 0)
+
+    merge_activities(base.setdefault("activities", {}), extra.get("activities") or {})
 
     # Merge tools
     for name, cnt in (extra.get("tools") or {}).items():
