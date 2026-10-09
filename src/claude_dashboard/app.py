@@ -14,26 +14,11 @@ from fastapi.staticfiles import StaticFiles
 
 from claude_dashboard.parser import EMPTY_TOKENS
 from claude_dashboard.scanner import RefreshReport, refresh
-from claude_dashboard.store import Store
+from claude_dashboard.store import Store, db_path
 
 _log = logging.getLogger("claude_dashboard")
 
-# DB location. DASHBOARD_DB lets tests, demos, and the screenshot generator
-# point at an isolated database so a run never has to touch (or scan) your
-# real ~/.claude data.
-def _default_db() -> Path:
-    # Source checkout (repo root has pyproject.toml): keep the DB in-tree at
-    # data/usage.db, as documented. Installed package (pipx/uvx/pip): the tree
-    # location would land inside site-packages and be wiped on reinstall, so
-    # use a per-user data dir instead.
-    root = Path(__file__).resolve().parent.parent.parent
-    if (root / "pyproject.toml").is_file():
-        return root / "data" / "usage.db"
-    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return base / "dashboard-for-claude-code" / "usage.db"
-
-
-_DB_PATH = Path(os.environ.get("DASHBOARD_DB") or _default_db())
+_DB_PATH = db_path()
 _STATIC = Path(__file__).parent / "static"
 
 # Optional token auth — active only when DASHBOARD_AUTH_TOKEN is set.

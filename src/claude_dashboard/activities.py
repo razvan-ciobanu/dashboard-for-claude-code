@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "15"
+RULES_VERSION = "16"
 
 ACTIVITIES = (
     "code", "docs", "test", "eval", "train", "review",
@@ -237,10 +237,22 @@ def _strip_wrappers(words: list[str]) -> list[str] | None:
         elif w in {"env", "timeout"} or (w.startswith("-") and len(words) > 1):
             words = words[2:] if w in {"-u", "-C", "timeout"} else words[1:]
         elif w == "uv" and len(words) > 1 and words[1] == "run":
-            words = [x for x in words[2:] if not x.startswith("--")]
+            words = _drop_options(words[2:], _UV_RUN_VALUED)
         else:
             break
     return words
+
+
+_UV_RUN_VALUED = {"--group", "--with", "--project", "--python", "--extra", "--package", "--env-file",
+                  "--directory", "--only-group", "-p"}
+
+
+def _drop_options(words: list[str], valued: set[str]) -> list[str]:
+    """Leading options of a wrapper, with the value of those that take one."""
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in valued else 1
+    return words[i:]
 
 
 def _is_run(words: list[str]) -> bool:
@@ -280,6 +292,7 @@ def _is_read_cmd(part: str, heredoc: bool) -> bool:
 WAIT_PREFIX = "wait → "
 ITEMS_KEPT = 100
 PROGRAMS_KEPT = 300
+PROGRAMS_PER_DAY_KEPT = 30
 OTHER_COMMANDS = "(other commands)"
 _NEUTRAL_HEADS = {"cd", "echo", "printf", "export", "unset", "set", "source", ".", "true", "mkdir", "date"}
 _REDIRECT = re.compile(r"\s*\d?>>?&?\s*(\S+)?|\s*<\s*\S+")
@@ -544,6 +557,7 @@ class ActivityTracker:
         self.task_acts: dict[str, str] = {}  # background task id -> act ("agent" for a subagent)
         self.task_sigs: dict[str, str] = {}  # background task id -> signature of what it runs
         self.tool_sigs: dict[str, str] = {}  # tool_use id -> signature
+        self.lines_by_day: dict[str, int] = {}
         self.untimed: set[str] = set()       # tool_use ids whose run time is not ours
         self.last_run: tuple[str, str] | None = None  # (act, sig) of the latest test/eval/train/build run
         self.run_paths: dict[str, tuple[str, str]] = {}  # path / job id named by a run -> (act, sig)
@@ -551,6 +565,13 @@ class ActivityTracker:
     def feed(self, line: dict):
         ltype = line.get("type")
         now = _ms(line.get("timestamp"))
+        patch = (line.get("toolUseResult") or {}).get("structuredPatch") \
+            if isinstance(line.get("toolUseResult"), dict) else None
+        if isinstance(patch, list):  # lines changed, on the day of the change
+            n = sum(1 for h in patch if isinstance(h, dict) for ln in h.get("lines") or []
+                    if isinstance(ln, str) and ln[:1] in "+-")
+            day = _local_day(now) or "unknown"
+            self.lines_by_day[day] = self.lines_by_day.get(day, 0) + n
         if ltype == "assistant":
             self._assistant(line, now)
         elif ltype == "user":
@@ -685,6 +706,7 @@ class ActivityTracker:
         by: dict[str, dict] = {}
         items: dict[str, dict] = {}
         programs: dict[str, dict] = {}
+        programs_by_day: dict[str, dict] = {}
         nxt: dict[str, dict] = {}
         by_day: dict[str, dict] = {}
         for i, rid in enumerate(self.order):
@@ -693,7 +715,9 @@ class ActivityTracker:
             sig = _call_signature(call, act)
             buckets = [by.setdefault(act, empty_bucket()), day.setdefault(act, empty_bucket()),
                        items.setdefault(act, {}).setdefault(sig, empty_bucket()),
-                       programs.setdefault(act, {}).setdefault(program_of(sig), empty_bucket())]
+                       programs.setdefault(act, {}).setdefault(program_of(sig), empty_bucket()),
+                       programs_by_day.setdefault(call["day"] or "unknown", {}).setdefault(act, {})
+                       .setdefault(program_of(sig), empty_bucket())]
             if act in EXPLORATION:
                 follow = "other"  # the turn ended on reading/answering
                 for j in range(i + 1, len(self.order)):
@@ -708,7 +732,8 @@ class ActivityTracker:
                 b["time_ms"] += call["time_ms"]
                 b["calls"] += 1
         return {"by_activity": by, "explore_next": nxt, "by_day": by_day,
-                "items": items, "programs": programs}
+                "items": items, "programs": programs, "programs_by_day": programs_by_day,
+                "lines_by_day": dict(self.lines_by_day)}
 
 
 def merge_activities(base: dict, extra: dict) -> dict:
@@ -719,6 +744,13 @@ def merge_activities(base: dict, extra: dict) -> dict:
         dst = base.setdefault(section, {})
         for key, buckets in (extra.get(section) or {}).items():
             _merge_buckets(dst.setdefault(key, {}), buckets)
+    days = base.setdefault("programs_by_day", {})
+    for day, by_act in (extra.get("programs_by_day") or {}).items():
+        for act, buckets in by_act.items():
+            _merge_buckets(days.setdefault(day, {}).setdefault(act, {}), buckets)
+    lines = base.setdefault("lines_by_day", {})
+    for day, n in (extra.get("lines_by_day") or {}).items():
+        lines[day] = lines.get(day, 0) + n
     return base
 
 
@@ -729,6 +761,8 @@ def trim_items(activities: dict) -> dict:
     to its activity's total."""
     for section, keep in (("items", ITEMS_KEPT), ("programs", PROGRAMS_KEPT)):
         _trim(activities.get(section) or {}, keep)
+    for by_act in (activities.get("programs_by_day") or {}).values():
+        _trim(by_act, PROGRAMS_PER_DAY_KEPT)
     return activities
 
 

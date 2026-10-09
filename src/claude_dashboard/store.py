@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -73,6 +74,21 @@ CREATE TABLE IF NOT EXISTS project_settings (
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 """
+
+
+def db_path() -> Path:
+    """The cache DB. DASHBOARD_DB lets tests, demos and the screenshot generator
+    point at an isolated database so a run never touches (or scans) real data.
+    Source checkout (repo root has pyproject.toml): data/usage.db in-tree, as
+    documented. Installed package (pipx/uvx/pip): a per-user data dir, since the
+    tree location would be inside site-packages and wiped on reinstall."""
+    if os.environ.get("DASHBOARD_DB"):
+        return Path(os.environ["DASHBOARD_DB"])
+    root = Path(__file__).resolve().parent.parent.parent
+    if (root / "pyproject.toml").is_file():
+        return root / "data" / "usage.db"
+    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "dashboard-for-claude-code" / "usage.db"
 
 
 class Store:
@@ -370,6 +386,20 @@ class Store:
                 out[section][act] = _top_items(sigs, keep=300 if section == "programs" else 100)
         out["reviews"] = summarize_reviews(passes)
         return out
+
+    def session_rows(self, path_prefixes: list[str]) -> list[sqlite3.Row]:
+        """Sessions whose project path is one of the prefixes or under it (a
+        repo and its worktrees), with the columns the usage report reads."""
+        rows = self._con.execute(
+            """SELECT session_id, project_path, custom_title, started_at, cost_usd,
+                      code_lines_added, code_lines_removed, subagent_count,
+                      activities_json, reviews_json
+               FROM sessions ORDER BY started_at"""
+        ).fetchall()
+        prefixes = [p.rstrip("/") for p in path_prefixes]
+        return [r for r in rows if any(
+            (r["project_path"] or "") == p or (r["project_path"] or "").startswith(p + "/")
+            for p in prefixes)]
 
     def list_sessions_for_paths(self, project_paths: list[str]) -> list[dict]:
         """Fetch sessions for multiple project paths (used for merged display-name groups)."""

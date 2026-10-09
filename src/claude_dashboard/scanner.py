@@ -126,7 +126,9 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                 sections = [acts.get("by_activity") or {}, acts.get("explore_next") or {},
                             *(acts.get("by_day") or {}).values(),
                             *(acts.get("items") or {}).values(),
-                            *(acts.get("programs") or {}).values()]
+                            *(acts.get("programs") or {}).values(),
+                            *(lists for by_act in (acts.get("programs_by_day") or {}).values()
+                              for lists in by_act.values())]
                 for section in sections:
                     for bucket in section.values():
                         bucket["cost_usd"] = estimate_cost(bucket["tokens_by_model"])["total"]
