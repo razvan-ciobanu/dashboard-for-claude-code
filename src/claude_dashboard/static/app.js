@@ -480,7 +480,9 @@ function groupProjectsByName(projects) {
 async function loadSessions() {
   try {
     _sessionsData = await fetchJSON(dataUrl("sessions"));
-    renderSessionsTable(_sessionsData);
+    // openProject may have drawn a project view while this was loading.
+    if (!new URLSearchParams(location.search).get("project"))
+      renderSessionsTable(_sessionsData);
   } catch (e) {
     document.getElementById("sessionsContent").innerHTML =
       `<p class="muted">Error: ${e.message}</p>`;
