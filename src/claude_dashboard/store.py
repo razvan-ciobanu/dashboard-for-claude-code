@@ -327,8 +327,34 @@ class Store:
                 d["project_name"] = s["display_name"]
             d["hidden"] = bool(s.get("hidden", False))
             d["summary"] = summaries.get(d["session_id"])
+            d.pop("activities", None)  # per-session detail only (get_session)
             result.append(d)
         return result
+
+    def activity_summary(self, project_paths: list[str] | None = None) -> dict:
+        """Activity breakdown summed over sessions: every visible project, or the
+        given project paths. Buckets are flattened to
+        {"tokens", "cost_usd", "time_ms", "calls"}; "daily" is
+        {date: {activity: bucket}}, a call counted on the day it started."""
+        if project_paths:
+            placeholders = ",".join("?" * len(project_paths))
+            rows = self._con.execute(
+                f"SELECT project_path, activities_json FROM sessions WHERE project_path IN ({placeholders})",  # nosec
+                project_paths,
+            ).fetchall()
+        else:
+            hidden = {p for p, s in self.get_all_project_settings().items() if s.get("hidden")}
+            rows = [r for r in self._con.execute(
+                "SELECT project_path, activities_json FROM sessions"
+            ).fetchall() if r["project_path"] not in hidden]
+        out: dict[str, dict] = {"by_activity": {}, "explore_next": {}, "daily": {}}
+        for r in rows:
+            acts = _loads_obj(r["activities_json"])
+            for section in ("by_activity", "explore_next"):
+                _add_flat(out[section], _as_obj(acts.get(section)))
+            for day, by_act in _as_obj(acts.get("by_day")).items():
+                _add_flat(out["daily"].setdefault(day, {}), _as_obj(by_act))
+        return out
 
     def list_sessions_for_paths(self, project_paths: list[str]) -> list[dict]:
         """Fetch sessions for multiple project paths (used for merged display-name groups)."""
@@ -350,6 +376,7 @@ class Store:
                 d["project_name"] = s["display_name"]
             d["hidden"] = bool(s.get("hidden", False))
             d["summary"] = summaries.get(d["session_id"])
+            d.pop("activities", None)  # per-session detail only (get_session)
             result.append(d)
         return result
 
@@ -419,6 +446,7 @@ class Store:
             d["tools"] = all_tools
             d.pop("tokens_json", None)
             d.pop("tools_json", None)
+            d.pop("activities", None)  # per-session detail only (get_session)
             result.append(d)
         return result
 
@@ -533,6 +561,20 @@ def _num(v: Any) -> float:
     valid object should not raise mid-aggregation.
     """
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def _add_flat(dst: dict, src: dict):
+    """Add activity buckets (tokens_by_model form) into flattened buckets."""
+    for act, b in src.items():
+        b = _as_obj(b)
+        d = dst.setdefault(act, {"tokens": 0, "cost_usd": 0.0, "time_ms": 0, "calls": 0})
+        d["tokens"] += sum(
+            _num(v) for counts in _as_obj(b.get("tokens_by_model")).values()
+            for v in _as_obj(counts).values()
+        )
+        d["cost_usd"] += _num(b.get("cost_usd"))
+        d["time_ms"] += _num(b.get("time_ms"))
+        d["calls"] += _num(b.get("calls"))
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:

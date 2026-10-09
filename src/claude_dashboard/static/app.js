@@ -411,6 +411,10 @@ async function loadOverview() {
   try {
     renderSkillsBar(_summaryData.skills || {});
   } catch (_) {}
+  loadOverviewActivities().catch((e) => {
+    document.getElementById("overviewActivity").innerHTML =
+      `<p class="muted">Error: ${e.message}</p>`;
+  });
 }
 
 async function loadProjects() {
@@ -882,6 +886,7 @@ function applyCustomRange() {
 }
 
 function renderDailyCost(daily) {
+  if (_overviewActivities) renderActivityDaily(); // shares the date range
   destroyChart("dailyCostChart");
   const series = buildDailySeries(daily);
   if (!series.length) return;
@@ -1482,6 +1487,7 @@ async function openProject(projectName, _pushUrl = true) {
       backBtn +
       heading +
       summary +
+      (IS_REMOTE ? "" : `<div id="projActivity" style="margin-bottom:20px"></div>`) +
       makeTable("proj-sessions", cols, sortedSessions, renderSessionRow, (s) =>
         openSessionModal(s.session_id),
       );
@@ -1496,6 +1502,16 @@ async function openProject(projectName, _pushUrl = true) {
       0,
       -1,
     );
+    if (!IS_REMOTE) {
+      const q = paths.map((p) => "path=" + encodeURIComponent(p)).join("&");
+      const acts = await fetchJSON("/api/activities?" + q);
+      // Gone if another openProject replaced the view while this one waited.
+      const el = document.getElementById("projActivity");
+      if (el) {
+        el.innerHTML = activitySectionHtml("proj-activity-table", acts);
+        renderActivityBreakdown("proj-activity-table", false);
+      }
+    }
   } catch (e) {
     document.getElementById("sessionsContent").innerHTML =
       `<p class="muted">Error: ${e.message}</p>`;
@@ -1662,10 +1678,11 @@ function renderSessionRow(s) {
   </tr>`;
 }
 
-// ── Activity breakdown (session modal) ─────────────────────────────────────
-// Tokens / cost / time per activity, from `s.activities` (see activities.py).
-// "Fold exploration" moves each exploring call into the activity that followed
-// it in the same turn (explore_next); exploration ending a turn lands in Other.
+// ── Activity breakdown ─────────────────────────────────────────────────────
+// Tokens / cost / time per activity (see activities.py), shown for a session
+// (modal), a project and all projects (overview). "Fold exploration" moves each
+// reading / querying / answering call into the activity that followed it in the
+// same turn (explore_next); exploration that ended a turn lands in Other.
 
 const ACTIVITY_LABELS = {
   code: "Writing code",
@@ -1678,26 +1695,36 @@ const ACTIVITY_LABELS = {
   git: "Git / PRs",
   ops: "Infra / ops",
   coord: "Coordination",
-  explore: "Exploration",
   other: "Other",
+  explore: "Reading code & files",
+  data: "Data queries",
+  web: "Web research",
+  think: "Thinking / answers",
 };
 const ACTIVITY_COLORS = {
-  code: "var(--accent)",
-  docs: "var(--purple)",
-  test: "var(--green)",
+  code: "#5a67f2",
+  docs: "#8173e3",
+  test: "#0ca30c",
   eval: "#d4a017",
   train: "#e07b39",
-  review: "var(--blue)",
+  review: "#3987e5",
   build: "#8b5a2b",
   git: "#2bb3a3",
   ops: "#c2569b",
   coord: "#6c8ebf",
-  explore: "var(--gray-300)",
-  other: "var(--red)",
+  other: "#e34948",
+  explore: "#a5a49a",
+  data: "#7d8f69",
+  web: "#b8a07a",
+  think: "#c9c7bd",
 };
-let _activitySession = null;
+const EXPLORATION = new Set(["explore", "data", "web", "think"]);
+const _activityData = {}; // element id -> activities ({by_activity, explore_next})
 
+// A bucket is either a session's {tokens_by_model, cost_usd, time_ms, calls}
+// or an aggregate's flattened {tokens, cost_usd, time_ms, calls}.
 function _bucketTokens(b) {
+  if (b.tokens != null) return b.tokens;
   return Object.values(b.tokens_by_model || {}).reduce(
     (sum, t) =>
       sum +
@@ -1720,7 +1747,7 @@ function activityRows(acts, fold) {
     r.calls += b.calls || 0;
   };
   for (const [act, b] of Object.entries(acts.by_activity || {}))
-    if (!(fold && act === "explore")) add(act, b);
+    if (!(fold && EXPLORATION.has(act))) add(act, b);
   if (fold)
     for (const [act, b] of Object.entries(acts.explore_next || {})) add(act, b);
   return Object.keys(ACTIVITY_LABELS)
@@ -1728,10 +1755,14 @@ function activityRows(acts, fold) {
     .map((a) => ({ act: a, ...rows[a] }));
 }
 
-function renderActivityBreakdown(fold) {
-  const el = document.getElementById("activity-breakdown");
-  if (!el || !_activitySession) return;
-  const rows = activityRows(_activitySession.activities || {}, fold);
+function _swatch(act) {
+  return `<span style="display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${ACTIVITY_COLORS[act]}"></span>`;
+}
+
+function renderActivityBreakdown(id, fold) {
+  const el = document.getElementById(id);
+  if (!el || !_activityData[id]) return;
+  const rows = activityRows(_activityData[id], fold);
   if (!rows.length) {
     el.innerHTML = '<span class="muted">No activity data — refresh to re-parse.</span>';
     return;
@@ -1758,7 +1789,7 @@ function renderActivityBreakdown(fold) {
       <tbody>${rows
         .map(
           (r) => `<tr>
-        <td><span style="display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${ACTIVITY_COLORS[r.act]}"></span>${ACTIVITY_LABELS[r.act]}</td>
+        <td>${_swatch(r.act)}${ACTIVITY_LABELS[r.act]}</td>
         <td class="right">${fmtBig(r.tokens)}</td>
         <td class="right cost">$${fmtCost(r.cost)}</td>
         <td class="right">${pct(r.cost, tot.cost)}</td>
@@ -1771,13 +1802,106 @@ function renderActivityBreakdown(fold) {
     <div class="muted" style="font-size:.72rem;margin-top:6px">Time is agent-time: generation plus tool runs, summed over the main thread and every subagent (${fmtDur(tot.time)}); waits for you are excluded.</div>`;
 }
 
-function activitySectionHtml(s) {
-  _activitySession = s;
-  return `<div class="section-title" style="display:flex;align-items:center;gap:12px">Activity Breakdown
+// Section markup; call renderActivityBreakdown(id, false) once it is in the DOM.
+function activitySectionHtml(id, acts, title = "Activity Breakdown") {
+  _activityData[id] = acts || {};
+  return `<div class="section-title" style="display:flex;align-items:center;gap:12px">${title}
       <label class="muted" style="font-size:.75rem;font-weight:normal;margin-left:auto;cursor:pointer">
-        <input type="checkbox" onchange="renderActivityBreakdown(this.checked)"> Fold exploration into the next action
+        <input type="checkbox" onchange="renderActivityBreakdown('${id}', this.checked)"> Fold exploration into the next action
       </label></div>
-    <div id="activity-breakdown"></div>`;
+    <div id="${id}"></div>`;
+}
+
+// ── Activity by day (overview) ───────────────────────────────────────────────
+
+let _overviewActivities = null;
+let _activityMetric = "cost_usd";
+
+async function loadOverviewActivities() {
+  if (IS_REMOTE) return; // the static export carries no activity aggregate
+  _overviewActivities = await fetchJSON("/api/activities");
+  document.getElementById("overviewActivity").innerHTML = activitySectionHtml(
+    "overview-activity-table",
+    _overviewActivities,
+    "All time",
+  );
+  renderActivityBreakdown("overview-activity-table", false);
+  renderActivityDaily();
+}
+
+function setActivityMetric(metric) {
+  _activityMetric = metric;
+  document
+    .querySelectorAll("#activityMetricToggle .seg-opt")
+    .forEach((b) => b.classList.toggle("active", b.dataset.metric === metric));
+  renderActivityDaily();
+}
+
+function renderActivityDaily() {
+  destroyChart("activityDailyChart");
+  const daily = (_overviewActivities || {}).daily || {};
+  const days = Object.keys(daily)
+    .filter((d) => d !== "unknown")
+    .sort();
+  if (!days.length) return;
+  const { start, end } = _resolveRange(days.map((d) => ({ date: d })));
+  const labels = [];
+  const cur = new Date(start + "T00:00:00");
+  const endDate = new Date(end + "T00:00:00");
+  for (let guard = 0; cur <= endDate && guard < 3660; guard++) {
+    labels.push(_ymd(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  const isTime = _activityMetric === "time_ms";
+  const scale = isTime ? 1 / 3600000 : 1;
+  const value = (d, a) => ((daily[d] && daily[d][a] && daily[d][a][_activityMetric]) || 0) * scale;
+  const datasets = Object.keys(ACTIVITY_LABELS)
+    .filter((a) => labels.some((d) => value(d, a) > 0))
+    .map((a) => ({
+      label: ACTIVITY_LABELS[a],
+      data: labels.map((d) => value(d, a)),
+      backgroundColor: ACTIVITY_COLORS[a],
+      stack: "acts",
+    }));
+  const light = document.documentElement.dataset.theme === "light";
+  _charts["activityDailyChart"] = new Chart(document.getElementById("activityDailyChart"), {
+    type: "bar",
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } },
+        tooltip: {
+          filter: (item) => item.raw > 0,
+          callbacks: {
+            label: (item) =>
+              `${item.dataset.label}: ${isTime ? item.raw.toFixed(1) + "h" : "$" + item.raw.toFixed(2)}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: true,
+          grid: { display: false },
+          ticks: {
+            autoSkip: true,
+            maxRotation: 0,
+            maxTicksLimit: 16,
+            callback(value) {
+              const lbl = this.getLabelForValue(value);
+              return typeof lbl === "string" ? lbl.slice(5) : lbl;
+            },
+          },
+        },
+        y: {
+          stacked: true,
+          grid: { color: light ? "#e1e0d9" : "#383835" },
+          ticks: { callback: (v) => (isTime ? v + "h" : "$" + v) },
+        },
+      },
+    },
+  });
 }
 
 // ── Session modal ──────────────────────────────────────────────────────────
@@ -1798,7 +1922,7 @@ async function openSessionModal(sessionId) {
         : "/api/sessions/" + sessionId,
     );
     document.getElementById("modalContent").innerHTML = buildSessionModal(s);
-    renderActivityBreakdown(false);
+    renderActivityBreakdown("activity-breakdown", false);
   } catch (e) {
     document.getElementById("modalContent").innerHTML =
       `<p class="muted">Error: ${e.message}</p>`;
@@ -1949,7 +2073,7 @@ function buildSessionModal(s) {
     </div>
     <div class="section-title">Activity &amp; Reliability</div>
     ${statGrid}
-    ${activitySectionHtml(s)}
+    ${activitySectionHtml("activity-breakdown", s.activities)}
     <div class="section-title">Tokens &amp; Est. API Cost by Model</div>
     ${modelRows}${costSummary}
     <div class="section-title">Tool Usage</div>

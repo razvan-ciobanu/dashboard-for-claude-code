@@ -150,6 +150,17 @@
             <canvas id="toolsBar"></canvas>
           </div>
         </div>
+        <div class="chart-card wide" style="margin-bottom: 28px">
+          <div class="chart-card-header">
+            <h3>Activity by Day <span class="muted" style="font-weight:400;font-size:.78rem">— follows the date range above</span></h3>
+            <div class="seg-toggle" id="activityMetricToggle">
+              <button class="seg-opt active" data-metric="cost_usd" onclick="setActivityMetric('cost_usd')">Est. Cost</button>
+              <button class="seg-opt" data-metric="time_ms" onclick="setActivityMetric('time_ms')">Time</button>
+            </div>
+          </div>
+          <canvas id="activityDailyChart"></canvas>
+          <div id="overviewActivity" style="margin-top:12px"></div>
+        </div>
         <div class="chart-card" style="margin-bottom: 28px">
           <h3>Projects by Cost</h3>
           <div id="projectsBar"></div>

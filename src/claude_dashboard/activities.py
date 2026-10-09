@@ -14,8 +14,10 @@ A run (script, container, batch job) is test / eval / train by the words of what
 it runs; other commands fall into build (docker build/push, tags, releases,
 dependency installs), git (commits, PRs, worktrees), ops (ssh, aws, terraform,
 ...) or coord (agents, messages, task tracking, Jira); a wait (polling loop, Monitor, `gh run watch`) takes the activity of the
-run it waits on — see `ActivityTracker._resolve_wait`. AskUserQuestion and
-foreground Agent waits are not timed.
+run it waits on — see `ActivityTracker._resolve_wait`. Waits on a person are
+not timed: AskUserQuestion, refused tools, MCP logins, and the run time of local
+file tools (Edit, Read, ...), which only ever means a pending permission prompt.
+Foreground Agent waits are not timed either (the subagent times its own work).
 
 Every call of a review subagent (its description mentions "review") is `review`.
 Subagent time is summed (agent-time), so it can exceed the session's wall time.
@@ -23,25 +25,37 @@ Subagent time is summed (agent-time), so it can exceed the session's wall time.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "7"
+RULES_VERSION = "9"
 
 ACTIVITIES = (
     "code", "docs", "test", "eval", "train", "review",
-    "build", "git", "ops", "coord", "explore", "other",
+    "build", "git", "ops", "coord", "other", "explore", "data", "web", "think",
 )
+# Reading / querying / answering: the activities "fold exploration" redistributes.
+EXPLORATION = frozenset({"explore", "data", "web", "think"})
 
 # Highest first: a call that both reads and edits code is `code`.
 _PRIORITY = {
     "test": 0, "train": 1, "eval": 2, "code": 3, "docs": 4,
-    "build": 5, "git": 6, "ops": 7, "coord": 8, "other": 9, "explore": 10,
+    "build": 5, "git": 6, "ops": 7, "coord": 8, "other": 9,
+    "data": 10, "web": 11, "explore": 12, "think": 13,
 }
 
 _EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
-_READ_TOOLS = {"Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch", "ToolSearch"}
+_READ_TOOLS = {"Read", "Grep", "Glob", "LS", "ToolSearch"}
+_WEB_TOOLS = {"WebSearch", "WebFetch"}
+# Database / warehouse MCP servers and query tools.
+_DATA_MCP = re.compile(r"^mcp__[^_]*(clickhouse|bigquery|postgres|mysql|snowflake|duckdb|sql|database)"
+                       r"|__(run_query|query|execute_sql|list_tables|list_databases)$", re.IGNORECASE)
+_DATA_CMDS = {"sqlite3", "psql", "mysql", "clickhouse", "clickhouse-client", "duckdb", "bq", "ch"}
+_SQL = re.compile(r"\bselect\b[\s\S]{0,2000}?\bfrom\b", re.IGNORECASE)
+_WEB_CMDS = {"curl", "wget", "http", "xh"}
+# A tool result saying a person refused it: the time until then was theirs.
+_REFUSED = re.compile(r"Permission for this tool use was denied|tool use was rejected|doesn't want to proceed")
 _READ_MCP = re.compile(r"(^|_)(get|list|read|search|query|fetch|describe|view)(_|$)")
 
 _DOC_EXT = {".md", ".mdx", ".txt", ".rst", ".adoc"}
@@ -70,6 +84,9 @@ _OPS_HEADS = {
 }
 _BUILD_HEADS = {"sbt", "mvn", "gradle", "cargo", "go", "npm", "pnpm", "yarn", "pip", "pip3", "poetry"}
 _UNTIMED_TOOLS = {"Agent", "AskUserQuestion", "ExitPlanMode", "SubagentHandback"}
+# Local file tools finish in milliseconds; any longer is a permission prompt
+# waiting on the person, so their run time is not counted.
+_INSTANT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "Read", "Grep", "Glob", "LS", "ToolSearch"}
 # MCP OAuth flows: the result arrives when the person finishes logging in.
 _AUTH_TOOLS = ("__authenticate", "__complete_authentication")
 _PATH_TOKEN = re.compile(r"[~\w.-]*/[\w./-]*[\w-]\.\w+")
@@ -97,6 +114,8 @@ _READ_CMDS = {
     "tree", "jq", "file", "stat", "diff", "which", "pwd", "echo", "printf", "sqlite3",
     "sort", "uniq", "cut", "tr", "awk", "column", "nl", "comm", "basename", "dirname",
     "realpath", "date", "true", "false", "test", "[", "unset", "export", "sleep",
+    "psql", "mysql", "clickhouse", "clickhouse-client", "duckdb", "bq", "ch",
+    "curl", "wget", "http", "xh",
 }
 _READ_GIT = {
     "log", "diff", "show", "status", "blame", "branch", "remote", "ls-files", "ls-tree",
@@ -148,6 +167,8 @@ def classify_bash(command: str) -> str:
     act = next((a for a in map(classify_run, runs) if a), None)
     if act:
         return act
+    if runs and _SQL.search(shell):
+        return "data"  # a query wrapper script (q.sh "select ...")
     # A heredoc script that writes a file (python - <<EOF ... write_text ...).
     for body in bodies:
         if _PY_WRITE.search(body):
@@ -159,7 +180,7 @@ def classify_bash(command: str) -> str:
     # Read-only when every command of a pipeline/sequence is a reader.
     bare_parts = [p.strip() for p in re.split(r"\|\||&&|[|;\n()]", bare) if p.strip()]
     if bare_parts and all(_is_read_cmd(p, bool(bodies)) for p in bare_parts):
-        return "explore"
+        return _read_kind(bare_parts, shell, bool(bodies))
     # Otherwise the most significant kind of tooling the non-reading parts use.
     acts = [_tool_kind(w) for p in bare_parts
             if (w := _strip_wrappers(p.split())) and not _is_read_cmd(p, bool(bodies))]
@@ -185,6 +206,23 @@ def _tool_kind(words: list[str]) -> str:
     if head in _OPS_HEADS:
         return "ops"
     return "other"
+
+
+def _read_kind(parts: list[str], shell: str, heredoc: bool) -> str:
+    """data (SQL, warehouse clients, analysis scripts, S3), web (curl) or explore."""
+    heads = []
+    for p in parts:
+        w = _strip_wrappers(p.split())
+        if w:
+            heads.append((w[0].rsplit("/", 1)[-1], w[1:]))
+    if _SQL.search(shell) or any(
+        h in _DATA_CMDS or h.startswith("python") or (h == "aws" and r[:1] == ["s3"])
+        for h, r in heads
+    ):
+        return "data"
+    if any(h in _WEB_CMDS for h, _ in heads):
+        return "web"
+    return "explore"
 
 
 def _strip_wrappers(words: list[str]) -> list[str] | None:
@@ -245,6 +283,10 @@ def classify_tool(name: str, inp: dict) -> str:
         return classify_bash(inp.get("command") or "")
     if name in _READ_TOOLS:
         return "explore"
+    if name in _WEB_TOOLS:
+        return "web"
+    if name.startswith("mcp__") and _DATA_MCP.search(name):
+        return "data"
     if name.startswith("mcp__") and _READ_MCP.search(name.rsplit("__", 1)[-1]):
         return "explore"
     if name in _COORD_TOOLS or _COORD_MCP.match(name):
@@ -256,6 +298,12 @@ def classify_tool(name: str, inp: dict) -> str:
 
 def is_review_agent(description: str | None) -> bool:
     return bool(description) and "review" in description.lower()
+
+
+def _local_day(ms: float | None) -> str | None:
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=UTC).astimezone().strftime("%Y-%m-%d")
 
 
 def _ms(ts: Any) -> float | None:
@@ -307,7 +355,8 @@ class ActivityTracker:
             return
         call = self.calls.get(rid)
         if call is None:
-            call = {"model": model, "usage": {}, "tools": [], "time_ms": 0, "turn": self.turn}
+            call = {"model": model, "usage": {}, "tools": [], "time_ms": 0, "turn": self.turn,
+                    "day": _local_day(now)}
             self.calls[rid] = call
             self.order.append(rid)
         call["time_ms"] += self._gap(now)  # generation latency (and streaming)
@@ -346,13 +395,16 @@ class ActivityTracker:
                         self._remember(str(block.get("content"))[:4000], found[2])
                     if found and not owner:
                         owner, owner_id = found, block.get("tool_use_id")
+                        if _REFUSED.search(str(block.get("content"))[:2000]):
+                            self.untimed.add(owner_id)  # waited on a person who said no
         if owner:
             rid, tool, _ = owner
             if owner_id in self.untimed:
                 tool = "Agent"
             # Tool run time — except a foreground Agent (the subagent times its own
             # work) and tools whose result is a person's answer (user wait).
-            if tool not in _UNTIMED_TOOLS and not tool.endswith(_AUTH_TOOLS):
+            if tool not in _UNTIMED_TOOLS and tool not in _INSTANT_TOOLS \
+                    and not tool.endswith(_AUTH_TOOLS):
                 self.calls[rid]["time_ms"] += self._gap(now)
         else:
             self.turn += 1  # user prompt / notification: the wait before it is nobody's
@@ -395,26 +447,29 @@ class ActivityTracker:
         if self.review:
             return "review"
         if not call["tools"]:
-            return "explore"
+            return "think"  # thinking / answering, no tool
         return min(call["tools"], key=_PRIORITY.__getitem__)
 
     def result(self) -> dict:
-        """{"by_activity": {act: bucket}, "explore_next": {act: bucket}} where a
-        bucket is {"tokens_by_model", "time_ms", "calls"}."""
+        """{"by_activity": {act: bucket}, "explore_next": {act: bucket},
+        "by_day": {local date: {act: bucket}}} where a bucket is
+        {"tokens_by_model", "time_ms", "calls"}. A call counts on the day it started."""
         from claude_dashboard.parser import _apply_tokens  # avoid an import cycle
 
         acts = [self._activity(self.calls[rid]) for rid in self.order]
         by: dict[str, dict] = {}
         nxt: dict[str, dict] = {}
+        by_day: dict[str, dict] = {}
         for i, rid in enumerate(self.order):
             call, act = self.calls[rid], acts[i]
-            buckets = [by.setdefault(act, empty_bucket())]
-            if act == "explore":
+            day = by_day.setdefault(call["day"] or "unknown", {})
+            buckets = [by.setdefault(act, empty_bucket()), day.setdefault(act, empty_bucket())]
+            if act in EXPLORATION:
                 follow = "other"  # the turn ended on reading/answering
                 for j in range(i + 1, len(self.order)):
                     if self.calls[self.order[j]]["turn"] != call["turn"]:
                         break
-                    if acts[j] != "explore":
+                    if acts[j] not in EXPLORATION:
                         follow = acts[j]
                         break
                 buckets.append(nxt.setdefault(follow, empty_bucket()))
@@ -422,19 +477,25 @@ class ActivityTracker:
                 _apply_tokens(b["tokens_by_model"], call["model"], call["usage"])
                 b["time_ms"] += call["time_ms"]
                 b["calls"] += 1
-        return {"by_activity": by, "explore_next": nxt}
+        return {"by_activity": by, "explore_next": nxt, "by_day": by_day}
 
 
 def merge_activities(base: dict, extra: dict) -> dict:
     """Add `extra` (a result() dict) into `base` in place."""
     for section in ("by_activity", "explore_next"):
-        dst = base.setdefault(section, {})
-        for act, b in (extra.get(section) or {}).items():
-            d = dst.setdefault(act, empty_bucket())
-            d["time_ms"] += b.get("time_ms", 0)
-            d["calls"] += b.get("calls", 0)
-            for model, counts in (b.get("tokens_by_model") or {}).items():
-                t = d["tokens_by_model"].setdefault(model, {})
-                for k, v in counts.items():
-                    t[k] = t.get(k, 0) + (v or 0)
+        _merge_buckets(base.setdefault(section, {}), extra.get(section) or {})
+    days = base.setdefault("by_day", {})
+    for day, acts in (extra.get("by_day") or {}).items():
+        _merge_buckets(days.setdefault(day, {}), acts)
     return base
+
+
+def _merge_buckets(dst: dict, src: dict):
+    for act, b in src.items():
+        d = dst.setdefault(act, empty_bucket())
+        d["time_ms"] += b.get("time_ms", 0)
+        d["calls"] += b.get("calls", 0)
+        for model, counts in (b.get("tokens_by_model") or {}).items():
+            t = d["tokens_by_model"].setdefault(model, {})
+            for k, v in counts.items():
+                t[k] = t.get(k, 0) + (v or 0)

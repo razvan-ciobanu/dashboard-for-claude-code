@@ -16,6 +16,16 @@ from claude_dashboard.store import Store
 AUTH_TOKEN = "s3cr3t-test-token"
 
 
+def _acts(day, **acts):
+    """A session's activities: {act: (time_ms, cost_usd)}, all on one day."""
+    def bucket(t, c):
+        return {"tokens_by_model": {"m": {"input": 10, "output": 0, "cache_read": 0,
+                                          "cache_write_5m": 0, "cache_write_1h": 0}},
+                "time_ms": t, "calls": 1, "cost_usd": c}
+    by = {a: bucket(*v) for a, v in acts.items()}
+    return {"by_activity": by, "explore_next": {}, "by_day": {day: by}}
+
+
 def _seed(db_path):
     store = Store(db_path)
     store.upsert_session({
@@ -31,6 +41,7 @@ def _seed(db_path):
             "input": 1_000_000, "output": 1_000_000,
             "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0}},
         "tools": {"Bash": 2, "Edit": 1}, "cost_usd": 18.0,
+        "activities": _acts("2026-05-10", code=(600_000, 10.0), explore=(300_000, 8.0)),
     })
     store.upsert_session({
         "session_id": "B", "project_path": "/p/beta", "project_name": "beta",
@@ -45,6 +56,7 @@ def _seed(db_path):
             "input": 100_000, "output": 50_000,
             "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0}},
         "tools": {"Read": 4}, "cost_usd": 25.0,
+        "activities": _acts("2026-05-11", test=(600_000, 25.0)),
     })
     store.close()
 
@@ -252,3 +264,18 @@ def test_project_merges_multiple_paths_under_one_display_name(client):
     assert {"claude-sonnet-4-6", "claude-opus-4-8"} <= set(body["tokens_by_model"])
     assert body["tools"].get("Bash") == 2 and body["tools"].get("Read") == 4
     assert len(body["sessions"]) == 2
+
+
+def test_activities_all_projects_and_by_path(client):
+    all_ = client.get("/api/activities").json()
+    assert all_["by_activity"]["code"] == {"tokens": 10, "cost_usd": 10.0, "time_ms": 600_000, "calls": 1}
+    assert set(all_["by_activity"]) == {"code", "explore", "test"}
+    assert set(all_["daily"]) == {"2026-05-10", "2026-05-11"}
+    beta = client.get("/api/activities", params={"path": "/p/beta"}).json()
+    assert set(beta["by_activity"]) == {"test"}
+    assert beta["daily"]["2026-05-11"]["test"]["cost_usd"] == 25.0
+
+
+def test_session_list_omits_activities_detail(client):
+    assert all("activities" not in s for s in client.get("/api/sessions").json())
+    assert "by_day" in client.get("/api/sessions/A").json()["activities"]

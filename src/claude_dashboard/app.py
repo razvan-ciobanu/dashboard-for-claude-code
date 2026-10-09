@@ -6,7 +6,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -179,6 +179,12 @@ def api_project(path: str = Query(None), name: str = Query(None)):
             base["tools"][tool] = base["tools"].get(tool, 0) + cnt
     base["sessions"] = _store.list_sessions_for_paths(all_paths)
     return base
+
+
+@app.get("/api/activities")
+def api_activities(path: Annotated[list[str] | None, Query()] = None):
+    """Activity breakdown over all visible projects, or the given project path(s)."""
+    return _store.activity_summary(path or None)
 
 
 @app.get("/api/sessions")

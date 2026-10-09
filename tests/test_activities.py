@@ -40,7 +40,11 @@ def test_classify_path(path, want):
     ("echo x >> src/mod.py", "code"),
     ("cat >> $WS/progress.md <<'EOF'\nTask 4 done\nEOF", "docs"),
     ("ls > /dev/null", "explore"),
-    ("python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF", "explore"),
+    ("python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF", "data"),
+    ("sqlite3 data/usage.db 'select count(*) from sessions'", "data"),
+    ("$S/q.sh \"select uid from events where d > 1\"", "data"),
+    ("aws s3 ls s3://bucket/prefix/", "data"),
+    ("curl -s https://example.com/api | jq .", "web"),
     ("python3 - <<'EOF'\nimport pathlib\npathlib.Path('tests/test_a.py').write_text('x')\nEOF", "test"),
     ("git commit -m 'x' && git push", "git"),
     ("git worktree add ../wt -b me/DP-1-test-hygiene", "git"),
@@ -72,6 +76,9 @@ def test_classify_tool():
     assert classify_tool("Edit", {"file_path": "src/a.py"}) == "code"
     assert classify_tool("Write", {"file_path": "docs/a.md"}) == "docs"
     assert classify_tool("Read", {"file_path": "src/a.py"}) == "explore"
+    assert classify_tool("WebSearch", {"query": "x"}) == "web"
+    assert classify_tool("mcp__clickhouse__run_query", {}) == "data"
+    assert classify_tool("mcp__clickhouse__list_tables", {}) == "data"
     assert classify_tool("mcp__jira__jira_get_issue", {}) == "explore"
     assert classify_tool("mcp__jira__jira_create_issue", {}) == "coord"
     assert classify_tool("Agent", {}) == "coord"
@@ -128,9 +135,9 @@ def test_tracker_attributes_tokens_and_time():
     r = _run([
         _prompt(0),
         _call(3, "r1", [("Read", {"file_path": "a.py"})]),        # 3s generating
-        _result(5, "r1-0"),                                       # 2s reading
+        _result(5, "r1-0"),                                       # reading: not timed
         _call(9, "r2", [("Edit", {"file_path": "a.py"})]),        # 4s generating
-        _result(10, "r2-0"),                                      # 1s editing
+        _result(10, "r2-0"),                                      # editing: not timed
         _call(12, "r3", [("Bash", {"command": "pytest -q"})]),    # 2s
         _result(42, "r3-0"),                                      # 30s tests
         _call(44, "r4"),                                          # 2s final answer
@@ -138,10 +145,12 @@ def test_tracker_attributes_tokens_and_time():
         _call(601, "r5"),
     ])
     by = r["by_activity"]
-    assert by["explore"]["time_ms"] == 5000 + 2000 + 1000
-    assert by["code"]["time_ms"] == 5000
+    assert by["explore"]["time_ms"] == 3000
+    assert by["think"]["time_ms"] == 2000 + 1000
+    assert by["code"]["time_ms"] == 4000
     assert by["test"]["time_ms"] == 32000
-    assert by["explore"]["calls"] == 3
+    assert by["explore"]["calls"] == 1
+    assert by["think"]["calls"] == 2
     assert _tok(by["code"]) == 111
     # r1 led to code; r4 and r5 ended their turns without an action.
     assert r["explore_next"]["code"]["calls"] == 1
@@ -300,3 +309,32 @@ def test_bare_timer_waits_on_the_latest_run():
         _result(603, "r2-0"),
     ])
     assert set(r["by_activity"]) == {"train"}
+
+
+def test_refused_tool_is_not_timed():
+    refused = _with_text(_result(259200, "r1-0"), (
+        "Permission for this tool use was denied. The tool use was rejected."))
+    r = _run([_prompt(0), _call(1, "r1", [("Bash", {"command": "git status"})]), refused])
+    assert r["by_activity"]["explore"]["time_ms"] == 1000
+
+
+def test_by_day_splits_a_long_session():
+    day1 = "2026-01-01T12:00:00.000Z"
+    day2 = "2026-01-03T12:00:00.000Z"
+    a = _call(0, "r1", [("Edit", {"file_path": "a.py"})])
+    a["timestamp"] = day1
+    b = _call(0, "r2", [("Edit", {"file_path": "b.py"})])
+    b["timestamp"] = day2
+    r = _run([a, _prompt(0) | {"timestamp": day2}, b])
+    days = r["by_day"]
+    assert len(days) == 2
+    assert all(set(acts) == {"code"} for acts in days.values())
+
+
+def test_local_file_tool_run_time_is_a_permission_wait():
+    r = _run([
+        _prompt(0),
+        _call(2, "r1", [("Edit", {"file_path": "a.py"})]),
+        _result(25_000, "r1-0"),  # approved hours later
+    ])
+    assert r["by_activity"]["code"]["time_ms"] == 2000
