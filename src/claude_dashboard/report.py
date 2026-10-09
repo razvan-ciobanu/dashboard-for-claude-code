@@ -120,6 +120,10 @@ def _totals(x: dict):
     x["cost_usd"] = sum(b["cost_usd"] for b in acts)
     x["agent_hours"] = sum(b["time_ms"] for b in acts) / 3.6e6
     x["cost_per_1k_lines"] = (1000 * x["cost_usd"] / x["lines_changed"]) if x["lines_changed"] else None
+    # Tokens per API call ≈ the context each call re-reads (cache reads dominate):
+    # the session-lifetime lever.
+    calls = sum(b["calls"] for b in acts)
+    x["context_k_per_call"] = sum(b["tokens"] for b in acts) / calls / 1000 if calls else None
 
 
 # ── markdown ─────────────────────────────────────────────────────────────────
@@ -135,19 +139,21 @@ def to_markdown(rep: dict, project: str) -> str:
     top = sorted(acts, key=lambda a: -cur["activities"].get(a, {}).get("cost_usd", 0))[:6]
     out = [f"# Claude usage — {project}", f"Generated {rep['generated']}.", ""]
 
-    out += ["## Weekly", "", "| Week | Cost | Agent-h | Active sessions | Lines changed | $/1k lines | "
+    out += ["## Weekly", "", "| Week | Cost | Agent-h | Active sessions | Lines changed | $/1k lines | Context k/call | "
             + " | ".join(f"{LABELS[a]} %" for a in top) + " |",
-            "|" + "---|" * (6 + len(top))]
+            "|" + "---|" * (7 + len(top))]
     for wk, w in rep["weekly"].items():
         per_k = f"{w['cost_per_1k_lines']:.2f}" if w["cost_per_1k_lines"] is not None else "—"
+        ctx = f"{w['context_k_per_call']:.0f}" if w["context_k_per_call"] is not None else "—"
         out.append(f"| {wk} | ${w['cost_usd']:.0f} | {w['agent_hours']:.1f} | {w['sessions']} | "
-                   f"{w['lines_changed']} | {per_k} | "
+                   f"{w['lines_changed']} | {per_k} | {ctx} | "
                    + " | ".join(f"{_share(w, a, 'cost_usd'):.0f}" for a in top) + " |")
 
     def headline(p):
         per_k = f"${p['cost_per_1k_lines']:.2f}" if p["cost_per_1k_lines"] is not None else "—"
+        ctx = f"{p['context_k_per_call']:.0f}k" if p["context_k_per_call"] is not None else "—"
         return (f"${p['cost_usd']:.0f}, {p['agent_hours']:.1f} agent-h, {p['sessions']} sessions, "
-                f"{p['lines_changed']} lines changed, {per_k} per 1k lines")
+                f"{p['lines_changed']} lines changed, {per_k} per 1k lines, {ctx} tokens of context per call")
 
     out += ["", f"## Last {cur['start']}..{cur['end']} vs {prev['start']}..{prev['end']}", "",
             f"- Current: {headline(cur)}", f"- Previous: {headline(prev)}", "",

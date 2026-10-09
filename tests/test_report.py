@@ -8,7 +8,7 @@ from claude_dashboard.report import build_report, to_markdown
 
 
 def _bucket(cost, ms):
-    return {"tokens_by_model": {}, "cost_usd": cost, "time_ms": ms, "calls": 1}
+    return {"tokens_by_model": {"m": {"cache_read": 400_000}}, "cost_usd": cost, "time_ms": ms, "calls": 1}
 
 
 def _row(sid, by_day, lines, programs_by_day=None, reviews=None):
@@ -33,6 +33,7 @@ def test_a_long_session_spreads_over_its_days():
     assert (cur["cost_usd"], cur["lines_changed"], cur["sessions"]) == (30.0, 1500, 1)
     assert (prev["cost_usd"], prev["lines_changed"], prev["sessions"]) == (10.0, 500, 1)
     assert cur["cost_per_1k_lines"] == 20.0
+    assert cur["context_k_per_call"] == 400.0
     assert list(cur["programs"]["code"]) == ["Edit *.py"]
     assert set(rep["weekly"]) == {"2026-09-28", "2026-10-05"}
     md = to_markdown(rep, "/repo")
