@@ -42,6 +42,12 @@ def _seed(db_path):
             "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0}},
         "tools": {"Bash": 2, "Edit": 1}, "cost_usd": 18.0,
         "activities": _acts("2026-05-10", code=(600_000, 10.0), explore=(300_000, 8.0)),
+        "reviews": {"passes": [
+            {"description": "Review PR #7", "kind": "initial", "target": "PR #7",
+             "started_at": "2026-05-10T09:05:00Z", "time_ms": 60_000, "calls": 3, "tokens": 9, "cost_usd": 3.0},
+            {"description": "Re-review PR #7 fix", "kind": "re-review", "target": "PR #7",
+             "started_at": "2026-05-10T09:20:00Z", "time_ms": 30_000, "calls": 2, "tokens": 4, "cost_usd": 1.0},
+        ]},
     })
     store.upsert_session({
         "session_id": "B", "project_path": "/p/beta", "project_name": "beta",
@@ -279,3 +285,12 @@ def test_activities_all_projects_and_by_path(client):
 def test_session_list_omits_activities_detail(client):
     assert all("activities" not in s for s in client.get("/api/sessions").json())
     assert "by_day" in client.get("/api/sessions/A").json()["activities"]
+
+
+def test_review_summary_in_aggregate_and_session(client):
+    rv = client.get("/api/activities").json()["reviews"]
+    assert (rv["passes"], rv["targets"]) == (2, 1)
+    assert rv["passes_per_target"] == {"2": 1}
+    assert rv["by_pass"]["2"]["cost_usd"] == 1.0
+    assert client.get("/api/sessions/A").json()["review_summary"]["top_targets"][0]["kinds"] == [
+        "initial", "re-review"]

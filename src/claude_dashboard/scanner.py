@@ -5,7 +5,13 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_dashboard.activities import RULES_VERSION, is_review_agent, trim_items
+from claude_dashboard.activities import (
+    RULES_VERSION,
+    is_review_agent,
+    review_kind,
+    review_target,
+    trim_items,
+)
 from claude_dashboard.parser import merge_stats, parse_file
 from claude_dashboard.pricing import estimate_cost, rate_revision
 from claude_dashboard.store import Store
@@ -90,10 +96,15 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                 stats["project_path"] = cwd
                 stats["project_name"] = cwd.rstrip("/").split("/")[-1] if cwd else project_dir.name
 
-                # Merge subagent stats
+                # Merge subagent stats; each review subagent is also one review pass.
+                stats["reviews"] = {"passes": []}
                 for sub_path in subagent_paths:
                     try:
-                        sub_stats = parse_file(sub_path, review=is_review_agent(_agent_description(sub_path)))
+                        desc = _agent_description(sub_path)
+                        review = is_review_agent(desc)
+                        sub_stats = parse_file(sub_path, review=review)
+                        if review:
+                            stats["reviews"]["passes"].append(_review_pass(desc, sub_stats))
                         merge_stats(stats, sub_stats)
                         sub_stat = os.stat(sub_path)
                         store.upsert_file(
@@ -169,6 +180,22 @@ def _find_subagents(session_jsonl: Path) -> list[Path]:
                 if f.is_file():
                     results.append(f)
     return results
+
+
+def _review_pass(description: str, sub_stats: dict) -> dict:
+    """One review subagent: what it reviewed, which pass kind, and its cost."""
+    bucket = (sub_stats.get("activities") or {}).get("by_activity", {}).get("review") or {}
+    tokens = bucket.get("tokens_by_model") or {}
+    return {
+        "description": description,
+        "kind": review_kind(description),
+        "target": review_target(description),
+        "started_at": sub_stats.get("started_at"),
+        "time_ms": bucket.get("time_ms", 0),
+        "calls": bucket.get("calls", 0),
+        "tokens": sum(v for c in tokens.values() for v in c.values()),
+        "cost_usd": estimate_cost(tokens)["total"],
+    }
 
 
 def _agent_description(sub_path: Path) -> str | None:

@@ -1782,6 +1782,55 @@ function setActivityItemsView(id, key, value) {
   renderActivityBreakdown(id);
 }
 
+// Review passes (activities.summarize_reviews): by kind, by pass number of the
+// same target, passes per target, and the most reviewed targets.
+const REVIEW_KIND_LABELS = { initial: "Initial review", "re-review": "Re-review", final: "Final (whole-branch)" };
+
+function _reviewPanelHtml(rv) {
+  if (!rv || !rv.passes)
+    return '<div class="muted" style="padding:6px 0;font-size:.78rem">No review subagents here — reviews done in the main thread are classified by what they ran.</div>';
+  const avg = rv.targets ? (rv.passes / rv.targets).toFixed(1) : "—";
+  const table = (title, rows) => `<div style="flex:1;min-width:260px">
+      <div class="muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">${title}</div>
+      <table style="font-size:.8rem"><thead><tr><th></th><th class="right">Passes</th><th class="right">Est. cost</th>
+        <th class="right">Time</th><th class="right">Cost / pass</th></tr></thead>
+      <tbody>${rows
+        .map(
+          ([label, b]) => `<tr><td>${label}</td><td class="right">${fmt(b.count)}</td>
+        <td class="right cost">$${fmtCost(b.cost_usd)}</td><td class="right">${fmtDur(b.time_ms)}</td>
+        <td class="right">$${fmtCost(b.count ? b.cost_usd / b.count : 0)}</td></tr>`,
+        )
+        .join("")}</tbody></table></div>`;
+  const kinds = ["initial", "re-review", "final"]
+    .filter((k) => rv.kinds[k])
+    .map((k) => [REVIEW_KIND_LABELS[k], rv.kinds[k]]);
+  const passes = ["1", "2", "3", "4+"]
+    .filter((k) => rv.by_pass[k])
+    .map((k) => [k === "4+" ? "4th and later" : ["", "1st", "2nd", "3rd"][+k] + " pass", rv.by_pass[k]]);
+  const dist = ["1", "2", "3", "4+"]
+    .map((k) => `<span style="margin-right:14px"><b>${fmt(rv.passes_per_target[k] || 0)}</b> <span class="muted">with ${k} pass${k === "1" ? "" : "es"}</span></span>`)
+    .join("");
+  const short = { initial: "I", "re-review": "R", final: "F" };
+  const top = (rv.top_targets || [])
+    .filter((t) => t.passes > 1)
+    .slice(0, 10)
+    .map(
+      (t) => `<tr title="${esc(t.descriptions.join("\n"))}"><td>${esc(t.target)}</td><td class="right">${t.passes}</td>
+        <td class="mono">${t.kinds.map((k) => short[k]).join(" → ")}</td>
+        <td class="right cost">$${fmtCost(t.cost_usd)}</td><td class="right">${fmtDur(t.time_ms)}</td></tr>`,
+    )
+    .join("");
+  return `<div style="padding:4px 0 12px">
+    <div style="font-size:.85rem;margin-bottom:8px"><b>${fmt(rv.passes)}</b> review passes over <b>${fmt(rv.targets)}</b> reviewed targets (PR, task, part) — <b>${avg}</b> passes per target on average</div>
+    <div style="font-size:.8rem;margin-bottom:10px">${dist}</div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap">${table("By kind", kinds)}${table("By pass number", passes)}</div>
+    ${top ? `<div class="muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 4px">Most reviewed (I = initial, R = re-review, F = final; hover for the descriptions)</div>
+    <table style="font-size:.8rem"><thead><tr><th>Target</th><th class="right">Passes</th><th>Sequence</th>
+      <th class="right">Est. cost</th><th class="right">Time</th></tr></thead><tbody>${top}</tbody></table>` : ""}
+    <div class="muted" style="font-size:.72rem;margin-top:10px;text-transform:uppercase;letter-spacing:.06em">Commands run by reviewers</div>
+  </div>`;
+}
+
 function _activityItemsHtml(id, act, actTime) {
   const st = _actState(id);
   // "program": every command grouped up to its first flag or path (complete);
@@ -1800,7 +1849,8 @@ function _activityItemsHtml(id, act, actTime) {
   const opt = (key, value, label) =>
     `<button class="seg-opt ${st[key] === value ? "active" : ""}" onclick="event.stopPropagation();setActivityItemsView('${id}','${key}','${value}')">${label}</button>`;
   const pct = (v) => (actTime ? Math.round((100 * v) / actTime) + "%" : "—");
-  return `<div style="padding:6px 0 10px 18px">
+  const reviewPanel = act === "review" ? _reviewPanelHtml((_activityData[id] || {}).reviews) : "";
+  return `<div style="padding:6px 0 10px 18px">${reviewPanel}
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;font-size:.75rem" class="muted">
       Group <span class="seg-toggle">${opt("group", "program", "Program")}${opt("group", "full", "Full command")}</span>
       Sort <span class="seg-toggle">${opt("sort", "time", "Time")}${opt("sort", "cost", "Cost")}${opt("sort", "calls", "Calls")}</span>
@@ -2142,7 +2192,7 @@ function buildSessionModal(s) {
     </div>
     <div class="section-title">Activity &amp; Reliability</div>
     ${statGrid}
-    ${activitySectionHtml("activity-breakdown", s.activities)}
+    ${activitySectionHtml("activity-breakdown", { ...(s.activities || {}), reviews: s.review_summary })}
     <div class="section-title">Tokens &amp; Est. API Cost by Model</div>
     ${modelRows}${costSummary}
     <div class="section-title">Tool Usage</div>

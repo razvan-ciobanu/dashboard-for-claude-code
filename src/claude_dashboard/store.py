@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from claude_dashboard.activities import OTHER_COMMANDS
+from claude_dashboard.activities import OTHER_COMMANDS, summarize_reviews
 from claude_dashboard.parser import EMPTY_TOKENS
 
 _SCHEMA = """
@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tokens_json         TEXT,
     tools_json          TEXT,
     activities_json     TEXT,
+    reviews_json        TEXT,
     cost_usd            REAL
 );
 
@@ -108,7 +109,7 @@ class Store:
             "bash_count": "INTEGER", "bash_interrupted": "INTEGER",
             "git_operations": "INTEGER", "tasks_completed": "INTEGER",
             "permission_modes_json": "TEXT", "skills_json": "TEXT",
-            "activities_json": "TEXT",
+            "activities_json": "TEXT", "reviews_json": "TEXT",
         }
         added = False
         for name, typ in wanted.items():
@@ -236,8 +237,8 @@ class Store:
                 tool_errors, user_rejections, bash_count, bash_interrupted,
                 git_operations, tasks_completed,
                 permission_modes_json, skills_json,
-                tokens_json, tools_json, activities_json, cost_usd)
-               VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?,?)
+                tokens_json, tools_json, activities_json, reviews_json, cost_usd)
+               VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?,?,?)
                ON CONFLICT(session_id) DO UPDATE SET
                  project_path=excluded.project_path,
                  project_name=excluded.project_name,
@@ -267,6 +268,7 @@ class Store:
                  tokens_json=excluded.tokens_json,
                  tools_json=excluded.tools_json,
                  activities_json=excluded.activities_json,
+                 reviews_json=excluded.reviews_json,
                  cost_usd=excluded.cost_usd""",
             (
                 s["session_id"], s.get("project_path"), s.get("project_name"),
@@ -287,6 +289,7 @@ class Store:
                 json.dumps(s.get("tokens_by_model", {})),
                 json.dumps(s.get("tools", {})),
                 json.dumps(s.get("activities", {})),
+                json.dumps(s.get("reviews", {})),
                 s.get("cost_usd", 0.0),
             ),
         )
@@ -306,6 +309,7 @@ class Store:
         if s.get("display_name"):
             d["project_name"] = s["display_name"]
         d["summary"] = self.get_summary(session_id)
+        d["review_summary"] = summarize_reviews(_review_passes(session_id, row["reviews_json"]))
         return d
 
     def list_sessions(self, project_path: str | None = None) -> list[dict]:
@@ -340,17 +344,19 @@ class Store:
         if project_paths:
             placeholders = ",".join("?" * len(project_paths))
             rows = self._con.execute(
-                f"SELECT project_path, activities_json FROM sessions WHERE project_path IN ({placeholders})",  # nosec
+                f"SELECT session_id, project_path, activities_json, reviews_json FROM sessions WHERE project_path IN ({placeholders})",  # nosec
                 project_paths,
             ).fetchall()
         else:
             hidden = {p for p, s in self.get_all_project_settings().items() if s.get("hidden")}
             rows = [r for r in self._con.execute(
-                "SELECT project_path, activities_json FROM sessions"
+                "SELECT session_id, project_path, activities_json, reviews_json FROM sessions"
             ).fetchall() if r["project_path"] not in hidden]
         out: dict[str, dict] = {"by_activity": {}, "explore_next": {}, "daily": {},
                                 "items": {}, "programs": {}}
+        passes = []
         for r in rows:
+            passes += _review_passes(r["session_id"], r["reviews_json"])
             acts = _loads_obj(r["activities_json"])
             for section in ("by_activity", "explore_next"):
                 _add_flat(out[section], _as_obj(acts.get(section)))
@@ -362,6 +368,7 @@ class Store:
         for section in ("items", "programs"):
             for act, sigs in out[section].items():
                 out[section][act] = _top_items(sigs, keep=300 if section == "programs" else 100)
+        out["reviews"] = summarize_reviews(passes)
         return out
 
     def list_sessions_for_paths(self, project_paths: list[str]) -> list[dict]:
@@ -571,6 +578,15 @@ def _num(v: Any) -> float:
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
 
 
+def _review_passes(session_id: str, raw: Any) -> list[dict]:
+    """A session's review passes, tagged with the session."""
+    passes = []
+    for p in _as_obj(_loads_obj(raw)).get("passes") or []:
+        if isinstance(p, dict) and p.get("kind") and p.get("target"):
+            passes.append({**p, "session_id": session_id})
+    return passes
+
+
 def _top_items(sigs: dict, keep: int = 100) -> dict:
     """The `keep` commands with the most time plus the `keep` costliest; the rest
     summed into OTHER_COMMANDS."""
@@ -610,6 +626,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "branches_json": "branches",
         "activity_json": "activity",
         "activities_json": "activities",
+        "reviews_json": "reviews",
     }
     for key, out_key in json_cols.items():
         if key in d:

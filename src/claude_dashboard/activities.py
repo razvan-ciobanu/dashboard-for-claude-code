@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "14"
+RULES_VERSION = "15"
 
 ACTIVITIES = (
     "code", "docs", "test", "eval", "train", "review",
@@ -392,8 +392,124 @@ def classify_tool(name: str, inp: dict) -> str:
     return "other"
 
 
+_REVIEW_START = re.compile(
+    r"\s*(/code-review|((scoped|delta|final|second|third|fourth|whole-branch|spec|quality|"
+    r"independent|adversarial|fresh|post-merge) )*(re-?)?review\b(?!-))", re.IGNORECASE)
+_FIXING = re.compile(r"\b(fix\w*|findings|minors|redo)\b", re.IGNORECASE)
+_FINAL_REVIEW = re.compile(r"^\s*final\b|whole-branch", re.IGNORECASE)
+_RE_REVIEW = re.compile(
+    r"re-?review|\bdelta\b|\b(second|third|fourth|fifth|2nd|3rd|4th)\b|\bround\s*\d|"
+    r"post-merge|follow-up|re-?check|\bfinal\b", re.IGNORECASE)
+_REVIEW_TARGETS = [
+    re.compile(r"#(\d+)"),
+    re.compile(r"\bPR\s*(\d+)", re.IGNORECASE),
+    re.compile(r"/code-review\s+(\d+)"),
+    re.compile(r"\b(Task\s+[A-Z]?\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r"\b(Part\s+[A-Z]\b)", re.IGNORECASE),
+    re.compile(r"\b(Phase\s+\d+)", re.IGNORECASE),
+]
+
+
 def is_review_agent(description: str | None) -> bool:
-    return bool(description) and "review" in description.lower()
+    """A subagent whose job is a review. "Fix PR #84 review findings" or
+    "Final-review fix wave" fix what a review found: they are not reviews."""
+    if not description or "review" not in description.lower():
+        return False
+    return bool(_REVIEW_START.match(description)) or not _FIXING.search(description)
+
+
+def review_kind(description: str) -> str:
+    """initial / re-review / final (a whole-branch pass at the end)."""
+    if _FINAL_REVIEW.search(description):
+        return "final"
+    return "re-review" if _RE_REVIEW.search(description) else "initial"
+
+
+PLAN_GAP_MS = 12 * 3600 * 1000
+_STRUCTURED_TARGET = re.compile(r"(PR #|Task |Part |Phase )")
+
+
+def _review_groups(passes: list[dict]) -> dict[tuple, list[dict]]:
+    """Group review passes by what they reviewed. A PR is one target per session.
+    Task / Part / Phase numbers restart with every plan, and a long session runs
+    several plans: a plan ends with its final (whole-branch) review, so an
+    initial review after a final one, or after a 12h pause, starts the next."""
+    groups: dict[tuple, list[dict]] = {}
+    by_session: dict[str, list[dict]] = {}
+    for p in passes:
+        by_session.setdefault(p.get("session_id") or "", []).append(p)
+    for sid, ps in by_session.items():
+        ps.sort(key=lambda p: p.get("started_at") or "")
+        plan, final_key, last = 0, None, None
+        for p in ps:
+            t = _ms(p.get("started_at"))
+            if p["kind"] == "initial" and (final_key or (t and last and t - last > PLAN_GAP_MS)):
+                plan, final_key = plan + 1, None
+            last = t or last
+            if p["target"].startswith("PR #"):
+                key = (sid, p["target"])
+            elif p["kind"] == "re-review" and final_key and not _STRUCTURED_TARGET.match(p["target"]):
+                key = final_key  # re-review of the final review's fix wave
+            else:
+                key = (sid, plan, p["target"])
+            if p["kind"] == "final":
+                final_key = key
+            groups.setdefault(key, []).append(p)
+    return groups
+
+
+def summarize_reviews(passes: list[dict]) -> dict:
+    """Review passes (scanner._review_pass entries with their session_id) summed
+    by kind, by pass number (1st, 2nd, ... review of the same target), and the
+    passes-per-target distribution."""
+    def add(d, p):
+        d["count"] += 1
+        d["cost_usd"] += p.get("cost_usd") or 0
+        d["time_ms"] += p.get("time_ms") or 0
+    def zero():
+        return {"count": 0, "cost_usd": 0.0, "time_ms": 0}
+
+    groups = _review_groups(passes)
+    kinds: dict[str, dict] = {}
+    by_pass: dict[str, dict] = {}
+    per_target: dict[str, int] = {}
+    targets = []
+    for group in groups.values():
+        for i, p in enumerate(group, 1):
+            add(kinds.setdefault(p["kind"], zero()), p)
+            add(by_pass.setdefault(str(i) if i < 4 else "4+", zero()), p)
+        n = len(group)
+        per_target[str(n) if n < 4 else "4+"] = per_target.get(str(n) if n < 4 else "4+", 0) + 1
+        targets.append({
+            "target": group[0]["target"],
+            "session_id": group[0].get("session_id"),
+            "passes": n,
+            "kinds": [p["kind"] for p in group],
+            "descriptions": [p["description"] for p in group],
+            "cost_usd": sum(p.get("cost_usd") or 0 for p in group),
+            "time_ms": sum(p.get("time_ms") or 0 for p in group),
+        })
+    targets.sort(key=lambda t: (t["passes"], t["cost_usd"]), reverse=True)
+    return {
+        "passes": len(passes),
+        "targets": len(groups),
+        "kinds": kinds,
+        "by_pass": by_pass,
+        "passes_per_target": per_target,
+        "top_targets": targets[:30],
+    }
+
+
+def review_target(description: str) -> str:
+    """What was reviewed, to count its passes: a PR number, else Task / Part /
+    Phase, else the description without its review words."""
+    for rx in _REVIEW_TARGETS:
+        if m := rx.search(description):
+            g = m.group(1)
+            return f"PR #{g}" if g.isdigit() else " ".join(g.split()).title()
+    bare = re.sub(r"(?i)\b(scoped|delta|final|second|third|fourth|whole-branch|re-?review|review|of|the)\b",
+                  " ", description)
+    return " ".join(bare.split()) or "(whole branch)"
 
 
 def _local_day(ms: float | None) -> str | None:

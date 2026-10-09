@@ -91,10 +91,29 @@ def test_classify_tool():
     assert classify_tool("AskUserQuestion", {}) == "other"
 
 
-def test_is_review_agent():
-    assert is_review_agent("Review PR #101")
-    assert is_review_agent("Delta review of commit")
-    assert not is_review_agent("Implement task 3.7")
+@pytest.mark.parametrize("desc,review,kind,target", [
+    ("Review PR #101 (iap launch window)", True, "initial", "PR #101"),
+    ("Review Task 4 (spec + quality)", True, "initial", "Task 4"),
+    ("Re-review Task 3 fix round 1", True, "re-review", "Task 3"),
+    ("Delta review #100 03fa020..5c381b6", True, "re-review", "PR #100"),
+    ("Third review of both PRs", True, "re-review", "both PRs"),
+    ("Final whole-branch review Phase 0", True, "final", "Phase 0"),
+    ("/code-review 1583 high", True, "initial", "PR #1583"),
+    ("Post-merge review #91 and #74 tail", True, "re-review", "PR #91"),
+    ("Final whole-branch review", True, "final", "(whole branch)"),
+    ("Delta review pin PRs #1932/#302 final", True, "re-review", "PR #1932"),
+    ("Fix PR #84 review findings", False, None, None),
+    ("Final-review fix wave Phase 1", False, None, None),
+    ("Implement task 3.7", False, None, None),
+])
+def test_review_agents(desc, review, kind, target):
+    assert is_review_agent(desc) is review
+    if review:
+        assert activities.review_kind(desc) == kind
+        assert activities.review_target(desc) == target
+
+
+def test_is_review_agent_without_description():
     assert not is_review_agent(None)
 
 
@@ -442,3 +461,39 @@ def test_wait_labels_do_not_nest():
         _result(65, "r3-0"),
     ])
     assert set(r["items"]["test"]) == {"pytest -m slow", "wait → pytest -m slow"}
+
+
+def test_summarize_reviews_counts_passes_per_target():
+    def p(group, kind, t, cost):
+        return {"session_id": "s", "target": group, "kind": kind, "started_at": t + "T10:00:00Z",
+                "description": kind, "cost_usd": cost, "time_ms": 1000}
+    summary = activities.summarize_reviews([
+        p("PR #1", "re-review", "2026-01-02", 2.0),
+        p("PR #1", "initial", "2026-01-01", 5.0),
+        p("PR #1", "final", "2026-01-03", 1.0),
+        p("PR #2", "initial", "2026-01-01", 4.0),
+    ])
+    assert summary["targets"] == 2 and summary["passes"] == 4
+    assert summary["passes_per_target"] == {"3": 1, "1": 1}
+    assert summary["by_pass"]["1"]["cost_usd"] == 9.0  # both initial passes
+    assert summary["by_pass"]["2"]["cost_usd"] == 2.0
+    assert summary["kinds"]["initial"]["count"] == 2
+    assert summary["top_targets"][0]["kinds"] == ["initial", "re-review", "final"]
+
+
+def test_task_numbers_restart_with_each_plan():
+    def p(target, kind, t):
+        return {"session_id": "s", "target": target, "kind": kind, "started_at": t,
+                "description": kind, "cost_usd": 1.0, "time_ms": 1}
+    summary = activities.summarize_reviews([
+        p("Task 1", "initial", "2026-01-01T10:00:00Z"),
+        p("Task 1", "re-review", "2026-01-01T10:30:00Z"),
+        p("(whole branch)", "final", "2026-01-01T11:00:00Z"),
+        p("fix wave", "re-review", "2026-01-01T11:30:00Z"),
+        p("Task 1", "initial", "2026-01-01T12:00:00Z"),        # next plan, same day
+        p("Task 1", "initial", "2026-01-03T09:00:00Z"),        # after a 12h+ pause
+        p("PR #9", "initial", "2026-01-01T10:00:00Z"),
+        p("PR #9", "re-review", "2026-01-03T10:00:00Z"),       # one PR across days
+    ])
+    # plan 1: Task 1 (2), final + its fix-wave re-review (2); plans 2, 3: Task 1; PR #9 (2)
+    assert summary["passes_per_target"] == {"2": 3, "1": 2}
