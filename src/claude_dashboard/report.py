@@ -2,7 +2,7 @@
 how that moves over time.
 
     python -m claude_dashboard.report /path/to/repo [/path/to/other-clone ...]
-        [--weeks 8] [--period-days 14] [--json]
+        [--weeks 8] [--period-days 14] [--json] [--snapshot DIR]
 
 A project is one or more path prefixes (a repo and its worktrees). The report
 refreshes the cache from ~/.claude first, then prints:
@@ -23,6 +23,7 @@ import argparse
 import json
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from claude_dashboard.activities import ACTIVITIES, OTHER_COMMANDS, summarize_reviews
 from claude_dashboard.scanner import refresh
@@ -31,6 +32,7 @@ from claude_dashboard.store import (
     _add_flat,
     _as_obj,
     _loads_obj,
+    _num,
     _review_passes,
     _top_items,
     db_path,
@@ -73,6 +75,7 @@ def build_report(rows: list, today: date, weeks: int, period_days: int) -> dict:
         lines = _as_obj(acts.get("lines_by_day"))
         progs_by_day = _as_obj(acts.get("programs_by_day"))
         active: set[str] = set()  # weeks / periods this session worked in
+        days_in = {name: 0 for name in periods}
         for day_s, by_act in _as_obj(acts.get("by_day")).items():
             try:
                 d = date.fromisoformat(day_s)
@@ -83,6 +86,15 @@ def build_report(rows: list, today: date, weeks: int, period_days: int) -> dict:
                 wk = _monday(d).isoformat()
                 buckets.append((wk, weekly.setdefault(wk, _empty_week())))
             buckets += [(name, p) for name, p in periods.items() if p["start"] <= d <= p["end"]]
+            for name, p in periods.items():
+                if p["start"] <= d <= p["end"]:
+                    days_in[name] += 1
+                    cost = sum(_num(_as_obj(b).get("cost_usd")) for b in _as_obj(by_act).values())
+                    top = p["top_sessions"].setdefault(r["session_id"], {
+                        "session_id": r["session_id"], "title": r["custom_title"],
+                        "started": (r["started_at"] or "")[:10], "cost_usd": 0.0, "active_days": 0})
+                    top["cost_usd"] += cost
+                    top["active_days"] += 1
             for key, x in buckets:
                 _add_flat(x["activities"], _as_obj(by_act))
                 x["lines_changed"] += int(lines.get(day_s) or 0)
@@ -95,6 +107,7 @@ def build_report(rows: list, today: date, weeks: int, period_days: int) -> dict:
         passes += _review_passes(r["session_id"], r["reviews_json"])
 
     for p in periods.values():
+        p["top_sessions"] = sorted(p["top_sessions"].values(), key=lambda t: -t["cost_usd"])[:5]
         p["reviews"] = summarize_reviews(
             [x for x in passes if p["start"] <= (_day(x.get("started_at")) or date.min) <= p["end"]])
         for act, sigs in p["programs"].items():
@@ -112,7 +125,7 @@ def _empty_week() -> dict:
 
 def _empty_period(start: date, end: date) -> dict:
     return {"start": start, "end": end, "activities": {}, "programs": {},
-            "sessions": 0, "lines_changed": 0}
+            "sessions": 0, "lines_changed": 0, "top_sessions": {}}
 
 
 def _totals(x: dict):
@@ -166,6 +179,12 @@ def to_markdown(rep: dict, project: str) -> str:
                    f"{c_now:.0f} | {c_prev:.0f} | {c_now - c_prev:+.0f} | "
                    f"{t_now:.0f} | {t_prev:.0f} | {t_now - t_prev:+.0f} |")
 
+    out += ["", "## Costliest sessions (current period)", ""]
+    for t in cur["top_sessions"]:
+        share = 100 * t["cost_usd"] / cur["cost_usd"] if cur["cost_usd"] else 0
+        out.append(f"- ${t['cost_usd']:.0f} ({share:.0f}%) — {t['title'] or t['session_id'][:8]}, "
+                   f"started {t['started']}, active {t['active_days']} day(s) in the period")
+
     out += ["", "## Heaviest commands (current period, by time)", ""]
     for a in top:
         progs = cur["programs"].get(a) or {}
@@ -192,11 +211,14 @@ def to_markdown(rep: dict, project: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("paths", nargs="+", help="project path prefix(es): a repo and its worktrees")
+    ap.add_argument("paths", nargs="+", help="project path prefix(es): a repo (its worktrees "
+                    "included) and any other clone, as separate arguments")
     ap.add_argument("--weeks", type=int, default=8)
     ap.add_argument("--period-days", type=int, default=14)
     ap.add_argument("--json", action="store_true", help="print the report data as JSON")
     ap.add_argument("--no-refresh", action="store_true", help="skip re-scanning ~/.claude")
+    ap.add_argument("--snapshot", metavar="DIR",
+                    help="also write the report data to DIR/snapshots/<today>.json")
     args = ap.parse_args(argv)
 
     store = Store(db_path())
@@ -205,8 +227,20 @@ def main(argv: list[str] | None = None) -> int:
         for err in report.errors:
             print(f"warning: {err}", file=sys.stderr)
     today = datetime.now().astimezone().date()
-    rep = build_report(store.session_rows(args.paths), today, args.weeks, args.period_days)
+    rows = store.session_rows(args.paths)
+    if not rows:
+        known = sorted({p["project_path"] for p in store.list_projects(include_hidden=True)})
+        store.close()
+        print(f"error: no session under {args.paths}. Known project paths:\n  "
+              + "\n  ".join(known), file=sys.stderr)
+        return 2
+    rep = build_report(rows, today, args.weeks, args.period_days)
     store.close()
+    if args.snapshot:
+        out = Path(args.snapshot).expanduser() / "snapshots" / f"{today.isoformat()}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(rep, indent=1, default=str))
+        print(f"snapshot: {out}", file=sys.stderr)
     if args.json:
         print(json.dumps(rep, indent=1, default=str))
     else:

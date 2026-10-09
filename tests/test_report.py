@@ -13,7 +13,8 @@ def _bucket(cost, ms):
 
 def _row(sid, by_day, lines, programs_by_day=None, reviews=None):
     return {
-        "session_id": sid, "started_at": None, "code_lines_added": 0, "code_lines_removed": 0,
+        "session_id": sid, "started_at": None, "custom_title": "refactor",
+        "code_lines_added": 0, "code_lines_removed": 0,
         "activities_json": json.dumps({"by_day": by_day, "lines_by_day": lines,
                                        "programs_by_day": programs_by_day or {}}),
         "reviews_json": json.dumps({"passes": reviews or []}),
@@ -34,7 +35,16 @@ def test_a_long_session_spreads_over_its_days():
     assert (prev["cost_usd"], prev["lines_changed"], prev["sessions"]) == (10.0, 500, 1)
     assert cur["cost_per_1k_lines"] == 20.0
     assert cur["context_k_per_call"] == 400.0
+    assert cur["top_sessions"] == [{"session_id": "s", "title": "refactor", "started": "",
+                                    "cost_usd": 30.0, "active_days": 1}]
     assert list(cur["programs"]["code"]) == ["Edit *.py"]
     assert set(rep["weekly"]) == {"2026-09-28", "2026-10-05"}
     md = to_markdown(rep, "/repo")
     assert "`Edit *.py` 60 min" in md
+
+
+def test_no_matching_session_is_an_error(tmp_path, monkeypatch, capsys):
+    from claude_dashboard import report
+    monkeypatch.setenv("DASHBOARD_DB", str(tmp_path / "empty.db"))
+    assert report.main(["/no/such/repo", "--no-refresh"]) == 2
+    assert "no session under" in capsys.readouterr().err
