@@ -38,10 +38,20 @@ def test_classify_path(path, want):
     ("aws batch describe-jobs --jobs 1", "explore"),
     ("cat > notes/plan.md <<'EOF'\nhello\nEOF", "docs"),
     ("echo x >> src/mod.py", "code"),
+    ("cat >> $WS/progress.md <<'EOF'\nTask 4 done\nEOF", "docs"),
     ("ls > /dev/null", "explore"),
     ("python3 - <<'EOF'\nimport json\nprint(json.load(open('a.json')))\nEOF", "explore"),
     ("python3 - <<'EOF'\nimport pathlib\npathlib.Path('tests/test_a.py').write_text('x')\nEOF", "test"),
     ("git commit -m 'x' && git push", "other"),
+    ("git worktree add ../wt -b me/DP-1-test-hygiene", "other"),
+    ("nohup uv run python scripts/validation/run_attribution.py --max-folds 4 > /tmp/a.log 2>&1 &", "eval"),
+    ("uv run python scripts/training/ecpm_grid_search.py --round r3 > run.log", "train"),
+    ("uv run python batch_run.py --name golden-dau --tag x", "test"),
+    ("aws batch submit-job --job-name retrain-ecpm --job-queue q", "train"),
+    ("docker run --rm img python -m swc_forecasting.smoke run", "test"),
+    ("uv run python scripts/deploy.py", "other"),
+    ("until grep -q DONE /tmp/a.log; do sleep 30; done", "wait"),
+    ("gh run watch 123 --exit-status", "wait"),
     ("sed -i '' 's/a/b/' src/x.py", "other"),
 ])
 def test_classify_bash(cmd, want):
@@ -159,3 +169,71 @@ def test_parse_and_merge_carry_activities(tmp_path):
     by = stats["activities"]["by_activity"]
     assert by["code"]["time_ms"] == 2000
     assert by["review"]["time_ms"] == 4000
+
+
+def test_wait_takes_the_activity_of_the_run_it_waits_on():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "nohup uv run python run_attribution.py > /tmp/s/att.log 2>&1 &"})]),
+        _result(2, "r1-0"),
+        _call(3, "r2", [("Bash", {"command": "until grep -q exit /tmp/s/att.log; do sleep 30; done"})]),
+        _result(603, "r2-0"),  # 10 min waiting on the evaluation
+    ])
+    assert set(r["by_activity"]) == {"eval"}
+    assert r["by_activity"]["eval"]["time_ms"] == 603000
+
+
+@pytest.mark.parametrize("cmd,want", [
+    ("gh run watch 36412627335 --exit-status --interval 30", "test"),
+    ("timeout 590 bash -c 'while ! grep -qE \"[0-9]+ (passed|failed)\" /tmp/x; do sleep 10; done'", "test"),
+    ("until grep -q 'eval_revenue_torch exit' /tmp/j.txt; do sleep 60; done", "eval"),
+    ("until [ -s /tmp/unknown.txt ]; do sleep 5; done", "other"),
+])
+def test_unlinked_wait_uses_its_own_words(cmd, want):
+    r = _run([_prompt(0), _call(1, "r1", [("Bash", {"command": cmd})])])
+    assert set(r["by_activity"]) == {want}
+
+
+def test_monitor_is_a_wait():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "uv run pytest tests > /tmp/s/t.out 2>&1 &"})]),
+        _call(2, "r2", [("Monitor", {"command": "tail -f /tmp/s/t.out | grep --line-buffered FAIL"})]),
+    ])
+    assert set(r["by_activity"]) == {"test"}
+
+
+def test_user_answers_are_not_timed():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("AskUserQuestion", {"questions": []})]),
+        _result(3601, "r1-0"),  # an hour until the user answered
+    ])
+    assert r["by_activity"]["other"]["time_ms"] == 1000
+
+
+def test_wait_on_a_background_run_output_file():
+    run = _call(1, "r1", [("Bash", {"command": "uv run pytest -m slow", "run_in_background": True})])
+    started = _result(2, "r1-0")
+    started["message"]["content"][0]["content"] = (
+        "Command running in background. Output is being written to: /tmp/s/tasks/b7.output")
+    r = _run([
+        _prompt(0), run, started,
+        _call(3, "r2", [("Bash", {"command": "until [ -s /tmp/s/tasks/b7.output ]; do sleep 5; done"})]),
+        _result(303, "r2-0"),
+    ])
+    assert set(r["by_activity"]) == {"test"}
+
+
+def test_wait_on_a_batch_job_id():
+    submit = _call(1, "r1", [("Bash", {"command": "aws batch submit-job --job-name grid-search-ecpm"})])
+    out = _result(2, "r1-0")
+    out["message"]["content"][0]["content"] = '{"jobId": "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"}'
+    r = _run([
+        _prompt(0), submit, out,
+        _call(3, "r2", [("Bash", {"command": (
+            "while aws batch describe-jobs --jobs 0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+            " | grep -q RUNNING; do sleep 60; done")})]),
+        _result(3603, "r2-0"),
+    ])
+    assert set(r["by_activity"]) == {"train"}

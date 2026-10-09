@@ -5,13 +5,14 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_dashboard.activities import is_review_agent
+from claude_dashboard.activities import RULES_VERSION, is_review_agent
 from claude_dashboard.parser import merge_stats, parse_file
 from claude_dashboard.pricing import estimate_cost, rate_revision
 from claude_dashboard.store import Store
 
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _RATE_REVISION_KEY = "pricing_rate_revision"
+_ACTIVITY_RULES_KEY = "activity_rules_version"
 
 
 @dataclass
@@ -41,6 +42,8 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
     # those stale numbers forever — so re-parse everything once after a rate edit.
     revision = rate_revision()
     reprice_all = store.get_meta(_RATE_REVISION_KEY) != revision
+    # Same for the activity breakdown when its classification rules change.
+    reprice_all = reprice_all or store.get_meta(_ACTIVITY_RULES_KEY) != RULES_VERSION
 
     for project_dir in sorted(_CLAUDE_PROJECTS.iterdir()):
         if not project_dir.is_dir():
@@ -135,6 +138,7 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
     # cost, so leaving the revision unrecorded makes the next refresh try again.
     if not report.errors:
         store.set_meta(_RATE_REVISION_KEY, revision)
+        store.set_meta(_ACTIVITY_RULES_KEY, RULES_VERSION)
 
     return report
 
