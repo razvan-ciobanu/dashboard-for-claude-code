@@ -98,6 +98,7 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
 
                 # Merge subagent stats; each review subagent is also one review pass.
                 stats["reviews"] = {"passes": []}
+                lanes = [{"lane": "main thread", "segments": stats.pop("timeline", [])}]
                 for sub_path in subagent_paths:
                     try:
                         desc = _agent_description(sub_path)
@@ -105,6 +106,8 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                         sub_stats = parse_file(sub_path, review=review)
                         if review:
                             stats["reviews"]["passes"].append(_review_pass(desc, sub_stats))
+                        lanes.append({"lane": desc or sub_path.stem, "review": review,
+                                      "segments": sub_stats.pop("timeline", [])})
                         merge_stats(stats, sub_stats)
                         sub_stat = os.stat(sub_path)
                         store.upsert_file(
@@ -134,6 +137,7 @@ def refresh(store: Store, prune: bool = False) -> RefreshReport:
                         bucket["cost_usd"] = estimate_cost(bucket["tokens_by_model"])["total"]
 
                 store.upsert_session(stats)
+                store.upsert_timeline(stats["session_id"], [x for x in lanes if x["segments"]])
                 store.upsert_file(str(jsonl_path), stats["session_id"], mtime, size)
 
                 if is_update:

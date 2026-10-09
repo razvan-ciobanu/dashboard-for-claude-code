@@ -2023,6 +2023,163 @@ function renderActivityDaily() {
   });
 }
 
+// ── Session timeline (Gantt) ─────────────────────────────────────────────────
+// One lane per thread (main + each subagent); segments [t0, t1, activity, calls,
+// program] from activities.timeline. Pauses longer than TL_GAP_MS (nights,
+// waits for you) are cut to a thin break so long sessions stay readable.
+
+const TL_GAP_MS = 30 * 60 * 1000;
+const TL_BREAK_PX = 6;
+const TL_ROW_H = 13;
+const TL_LABEL_W = 230;
+const TL_MIN_STEP_MS = 60 * 1000; // shorter segments are drawn, not listed as steps
+const ACTIVITY_SHORT = {
+  code: "code", docs: "docs", test: "test", eval: "eval", train: "train",
+  review: "review", build: "build", git: "git", ops: "ops", coord: "coord",
+  other: "other", explore: "read", data: "data", web: "web", think: "think",
+};
+let _timeline = null; // {lanes, fold, period: index of the work period shown, or "all"}
+
+function timelineSectionHtml() {
+  return `<div class="section-title" style="display:flex;align-items:center;gap:12px">Timeline
+      <label class="muted" style="font-size:.75rem;font-weight:normal;margin-left:auto;cursor:pointer">
+        <input type="checkbox" onchange="_timeline.fold=this.checked;renderTimeline()"> Fold exploration into the next step
+      </label></div>
+    <div id="session-timeline"><div class="loading"><div class="spinner"></div> Loading timeline…</div></div>`;
+}
+
+async function loadTimeline(sessionId) {
+  const el = document.getElementById("session-timeline");
+  try {
+    const lanes = await fetchJSON("/api/sessions/" + sessionId + "/timeline");
+    const blocks = _timelineBlocks(lanes);
+    const active = blocks.reduce((t, b) => t + (b.end - b.start), 0);
+    // A long session opens on its latest work period; a short one shows all.
+    _timeline = { lanes, fold: false, period: blocks.length > 1 && active > 6 * 3600000 ? blocks.length - 1 : "all" };
+    renderTimeline();
+  } catch (e) {
+    if (el) el.innerHTML = `<p class="muted">${esc(e.message)}</p>`;
+  }
+}
+
+// Active blocks: the union of all segments, split where nothing ran for TL_GAP_MS.
+function _timelineBlocks(lanes) {
+  const spans = lanes.flatMap((l) => l.segments.map((s) => [s[0], s[1]])).sort((a, b) => a[0] - b[0]);
+  const blocks = [];
+  for (const [a, b] of spans) {
+    const last = blocks[blocks.length - 1];
+    if (last && a - last.end <= TL_GAP_MS) last.end = Math.max(last.end, b);
+    else blocks.push({ start: a, end: b });
+  }
+  return blocks;
+}
+
+// Steps: every segment of every lane in time order, consecutive repeats joined.
+function _timelineSteps(lanes, fold) {
+  const segs = lanes.flatMap((l) => l.segments).sort((a, b) => a[0] - b[0]);
+  const steps = [];
+  for (const s of segs) {
+    if ((fold && EXPLORATION.has(s[2])) || s[1] - s[0] < TL_MIN_STEP_MS) continue;
+    const last = steps[steps.length - 1];
+    if (last && last.act === s[2]) {
+      last.ms += s[1] - s[0];
+      last.calls += s[3];
+    } else steps.push({ act: s[2], ms: s[1] - s[0], calls: s[3] });
+  }
+  return steps;
+}
+
+function renderTimeline() {
+  const el = document.getElementById("session-timeline");
+  if (!el || !_timeline) return;
+  const periods = _timelineBlocks(_timeline.lanes);
+  const sel = _timeline.period === "all" ? null : periods[_timeline.period];
+  const options = [`<option value="all" ${sel ? "" : "selected"}>All (${periods.length} work period${periods.length > 1 ? "s" : ""})</option>`]
+    .concat(
+      periods.map((b, i) => {
+        const d = new Date(b.start);
+        const lbl = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} · ${fmtDur(b.end - b.start)}`;
+        return `<option value="${i}" ${sel === b ? "selected" : ""}>${lbl}</option>`;
+      }),
+    )
+    .join("");
+  const picker = periods.length > 1
+    ? `<div style="margin-bottom:8px;font-size:.78rem" class="muted">Work period <select onchange="_timeline.period=this.value==='all'?'all':+this.value;renderTimeline()">${options}</select></div>`
+    : "";
+  const inPeriod = (seg) => !sel || (seg[1] >= sel.start && seg[0] <= sel.end);
+  const lanes = _timeline.lanes
+    .map((l) => ({ ...l, segments: l.segments.filter(inPeriod) }))
+    .filter((l) => l.segments.length)
+    .map((l) => ({ ...l, first: l.segments[0][0], main: l.lane === "main thread" }))
+    .sort((a, b) => (b.main - a.main) || a.first - b.first);
+  if (!lanes.length) {
+    el.innerHTML = '<span class="muted">No timeline data — refresh to re-parse.</span>';
+    return;
+  }
+  const blocks = _timelineBlocks(lanes);
+  const width = Math.max(700, el.clientWidth || 900);
+  const plotW = width - TL_LABEL_W - 10 - TL_BREAK_PX * (blocks.length - 1);
+  const active = blocks.reduce((t, b) => t + Math.max(b.end - b.start, 1), 0);
+  let off = 0;
+  for (const b of blocks) {
+    b.x = TL_LABEL_W + off;
+    b.w = (Math.max(b.end - b.start, 1) / active) * plotW;
+    off += b.w + TL_BREAK_PX;
+  }
+  const x = (t) => {
+    let b = blocks[0];
+    for (const c of blocks) if (c.start <= t) b = c;
+    return b.x + (Math.min(Math.max(t - b.start, 0), b.end - b.start) / Math.max(b.end - b.start, 1)) * b.w;
+  };
+  const axisH = 18;
+  const height = axisH + lanes.length * (TL_ROW_H + 3) + 4;
+  const fmtT = (t) => {
+    const d = new Date(t);
+    return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  };
+  // Axis: each active block's start time, where it fits; breaks as dashed lines.
+  let lastLabelX = -1e9;
+  const axis = blocks
+    .map((b, i) => {
+      const brk = i ? `<line x1="${b.x - TL_BREAK_PX / 2}" x2="${b.x - TL_BREAK_PX / 2}" y1="0" y2="${height}" stroke="var(--border, #ccc)" stroke-dasharray="2,2"/>` : "";
+      if (b.x - lastLabelX < 80) return brk;
+      lastLabelX = b.x;
+      return `${brk}<text x="${b.x + 2}" y="11" font-size="9" fill="currentColor" opacity=".6">${fmtT(b.start)}</text>`;
+    })
+    .join("");
+  const rows = lanes
+    .map((l, i) => {
+      const y = axisH + i * (TL_ROW_H + 3);
+      const label = l.lane.length > 34 ? l.lane.slice(0, 33) + "…" : l.lane;
+      const rects = l.segments
+        .map((s) => {
+          const x0 = x(s[0]);
+          const w = Math.max(x(s[1]) - x0, 1);
+          return `<rect x="${x0.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="${TL_ROW_H}" fill="${ACTIVITY_COLORS[s[2]]}"><title>${esc(ACTIVITY_LABELS[s[2]])} · ${fmtDur(s[1] - s[0])} · ${s[3]} call${s[3] > 1 ? "s" : ""} · ${esc(s[4])}\n${fmtT(s[0])} – ${fmtT(s[1])}</title></rect>`;
+        })
+        .join("");
+      return `<text x="0" y="${y + 10}" font-size="10" fill="currentColor" font-weight="${l.main ? 600 : 400}"><title>${esc(l.lane)}</title>${esc(label)}</text>${rects}`;
+    })
+    .join("");
+  const steps = _timelineSteps(lanes, _timeline.fold);
+  const shown = steps.slice(0, 80);
+  const chips = shown
+    .map(
+      (s) => `<span title="${esc(ACTIVITY_LABELS[s.act])} · ${fmtDur(s.ms)} · ${s.calls} calls" style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:.72rem;background:${ACTIVITY_COLORS[s.act]};color:#fff;margin:2px 0">${ACTIVITY_SHORT[s.act]}</span>`,
+    )
+    .join('<span class="muted" style="font-size:.7rem"> → </span>');
+  const legend = [...new Set(lanes.flatMap((l) => l.segments.map((s) => s[2])))]
+    .map((a) => `<span style="margin-right:10px;font-size:.72rem">${_swatch(a)}${ACTIVITY_LABELS[a]}</span>`)
+    .join("");
+  el.innerHTML = `${picker}
+    <div style="line-height:1.9;margin-bottom:8px">${chips}${steps.length > shown.length ? ` <span class="muted" style="font-size:.72rem">… +${steps.length - shown.length} more steps</span>` : ""}</div>
+    <div style="max-height:480px;overflow:auto;border:1px solid var(--border, #ddd);border-radius:6px;padding:4px">
+      <svg width="${width}" height="${height}" style="display:block">${axis}${rows}</svg>
+    </div>
+    <div style="margin-top:6px">${legend}</div>
+    <div class="muted" style="font-size:.72rem;margin-top:4px">${lanes.length} thread${lanes.length > 1 ? "s" : ""} (main first, then subagents by start). Pauses over ${TL_GAP_MS / 60000} min are cut (dashed lines). Hover a segment for its duration, calls and main command; the strip above lists the steps in time order across all threads (steps under a minute are only drawn).</div>`;
+}
+
 // ── Session modal ──────────────────────────────────────────────────────────
 
 function _sessionModalKey(e) {
@@ -2042,6 +2199,7 @@ async function openSessionModal(sessionId) {
     );
     document.getElementById("modalContent").innerHTML = buildSessionModal(s);
     renderActivityBreakdown("activity-breakdown", false);
+    if (!IS_REMOTE) loadTimeline(sessionId);
   } catch (e) {
     document.getElementById("modalContent").innerHTML =
       `<p class="muted">Error: ${e.message}</p>`;
@@ -2193,6 +2351,7 @@ function buildSessionModal(s) {
     <div class="section-title">Activity &amp; Reliability</div>
     ${statGrid}
     ${activitySectionHtml("activity-breakdown", { ...(s.activities || {}), reviews: s.review_summary })}
+    ${IS_REMOTE ? "" : timelineSectionHtml()}
     <div class="section-title">Tokens &amp; Est. API Cost by Model</div>
     ${modelRows}${costSummary}
     <div class="section-title">Tool Usage</div>

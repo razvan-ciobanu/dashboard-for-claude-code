@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # Bump when a classification rule changes: the scanner then re-parses every session.
-RULES_VERSION = "16"
+RULES_VERSION = "19"
 
 ACTIVITIES = (
     "code", "docs", "test", "eval", "train", "review",
@@ -591,17 +591,25 @@ class ActivityTracker:
         call = self.calls.get(rid)
         if call is None:
             call = {"model": model, "usage": {}, "tools": [], "sigs": [], "time_ms": 0,
-                    "turn": self.turn, "day": _local_day(now)}
+                    "turn": self.turn, "day": _local_day(now),
+                    # wall-clock span: from the event it answers to its last timed event
+                    "t0": self.last_ms if self.last_ms is not None else now, "t1": now}
             self.calls[rid] = call
             self.order.append(rid)
         call["time_ms"] += self._gap(now)  # generation latency (and streaming)
         if now is not None:
             self.last_ms = now
+            call["t1"] = now
         call["usage"] = msg.get("usage") or call["usage"]  # last line wins
         for block in msg.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 name, inp = block.get("name", ""), block.get("input") or {}
                 act, sig = self._classify(name, inp)
+                if act == "agent":
+                    # Waiting on a subagent: coordination, and its work is timed
+                    # in the subagent's own transcript.
+                    act = "coord"
+                    self.untimed.add(block.get("id"))
                 if name == "TaskOutput":
                     # Waiting on a background task: it is that task's work. A
                     # subagent's work is timed in its own transcript.
@@ -627,7 +635,9 @@ class ActivityTracker:
                     if found:
                         text = str(block.get("content"))[:4000]
                         for tid in _TASK_ID.findall(text):
-                            self.task_acts[tid] = "agent" if found[1] == "Agent" else found[2]
+                            # A subagent, or a background timer waiting on one.
+                            waits_on_agent = found[1] == "Agent" or block.get("tool_use_id") in self.untimed
+                            self.task_acts[tid] = "agent" if waits_on_agent else found[2]
                             self.task_sigs[tid] = self.tool_sigs.get(block.get("tool_use_id"), "")
                     if found and found[2] in _RUN_ACTS:
                         # A run's result names where it writes / what it started
@@ -647,6 +657,8 @@ class ActivityTracker:
             if tool not in _UNTIMED_TOOLS and tool not in _INSTANT_TOOLS \
                     and not tool.endswith(_AUTH_TOOLS):
                 self.calls[rid]["time_ms"] += self._gap(now)
+                if now is not None:
+                    self.calls[rid]["t1"] = now
         else:
             self.turn += 1  # user prompt / notification: the wait before it is nobody's
         if now is not None:
@@ -657,6 +669,8 @@ class ActivityTracker:
         cmd = inp.get("command") or ""
         act = "wait" if name == "Monitor" else classify_tool(name, inp)
         sig = signature(name, inp)
+        if name == "Agent":
+            self.last_run = ("agent", sig)  # timers after it wait on the subagent
         if act in _RUN_ACTS:
             self.last_run = (act, sig)
             if cmd:
@@ -696,6 +710,9 @@ class ActivityTracker:
             return "think"  # thinking / answering, no tool
         return min(call["tools"], key=_PRIORITY.__getitem__)
 
+    def timeline(self) -> list[list]:
+        return _timeline(self)
+
     def result(self) -> dict:
         """{"by_activity": {act: bucket}, "explore_next": {act: bucket},
         "by_day": {local date: {act: bucket}}} where a bucket is
@@ -734,6 +751,37 @@ class ActivityTracker:
         return {"by_activity": by, "explore_next": nxt, "by_day": by_day,
                 "items": items, "programs": programs, "programs_by_day": programs_by_day,
                 "lines_by_day": dict(self.lines_by_day)}
+
+
+TIMELINE_JOIN_MS = 10 * 60 * 1000
+
+
+def _timeline(tracker: ActivityTracker) -> list[list]:
+    """The thread's calls as segments [t0_ms, t1_ms, activity, calls, program]:
+    consecutive calls of one activity joined while less than TIMELINE_JOIN_MS
+    apart; `program` is the one that took most of the segment's time."""
+    segs: list[list] = []
+    progs: dict[str, float] = {}
+    for rid in tracker.order:
+        call = tracker.calls[rid]
+        t0, t1 = call.get("t0"), call.get("t1")
+        if t0 is None or t1 is None:
+            continue
+        act = tracker._activity(call)
+        prog = program_of(_call_signature(call, act))
+        last = segs[-1] if segs else None
+        if last and last[2] == act and t0 - last[1] <= TIMELINE_JOIN_MS:
+            last[1] = int(max(last[1], t1))
+            last[3] += 1
+        else:
+            if last:
+                last[4] = max(progs, key=progs.get)
+            segs.append([int(t0), int(t1), act, 1, prog])
+            progs = {}
+        progs[prog] = progs.get(prog, 0) + max(call["time_ms"], 1)
+    if segs:
+        segs[-1][4] = max(progs, key=progs.get)
+    return segs
 
 
 def merge_activities(base: dict, extra: dict) -> dict:

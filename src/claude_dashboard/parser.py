@@ -130,6 +130,7 @@ def parse_file(path: str | Path, review: bool = False) -> dict[str, Any]:
 
     _derive_primary_branch(stats)
     stats["activities"] = tracker.result()
+    stats["timeline"] = tracker.timeline()  # this thread only; merge_stats leaves it
 
     stats["started_at"] = first_ts
     stats["ended_at"] = last_ts

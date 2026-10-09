@@ -185,6 +185,16 @@ def api_session(session_id: str):
     return s
 
 
+@app.get("/api/sessions/{session_id}/timeline")
+def api_session_timeline(session_id: str):
+    """Gantt lanes: the main thread and each subagent, as activity segments
+    [t0_ms, t1_ms, activity, calls, program]."""
+    lanes = _store.get_timeline(session_id)
+    if lanes is None:
+        raise HTTPException(404, "No timeline for this session (refresh to re-parse)")
+    return lanes
+
+
 @app.get("/api/settings")
 def api_get_settings():
     return _store.get_all_project_settings()

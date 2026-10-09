@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS project_settings (
     hidden       INTEGER NOT NULL DEFAULT 0
 );
 
+-- Per-session Gantt lanes (activities.timeline), read only by the session view.
+CREATE TABLE IF NOT EXISTS timelines (
+    session_id TEXT PRIMARY KEY,
+    lanes_json TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 """
@@ -191,6 +197,7 @@ class Store:
 
     def delete_session(self, session_id: str):
         self._con.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        self._con.execute("DELETE FROM timelines WHERE session_id = ?", (session_id,))
         self._con.commit()
 
     # ── AI/user session summaries ────────────────────────────────────────────
@@ -310,6 +317,20 @@ class Store:
             ),
         )
         self._con.commit()
+
+    def upsert_timeline(self, session_id: str, lanes: list[dict]):
+        self._con.execute(
+            "INSERT INTO timelines (session_id, lanes_json) VALUES (?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET lanes_json = excluded.lanes_json",
+            (session_id, json.dumps(lanes, separators=(",", ":"))),
+        )
+        self._con.commit()
+
+    def get_timeline(self, session_id: str) -> list[dict] | None:
+        row = self._con.execute(
+            "SELECT lanes_json FROM timelines WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return json.loads(row["lanes_json"]) if row else None
 
     # ── queries ────────────────────────────────────────────────────────────
 

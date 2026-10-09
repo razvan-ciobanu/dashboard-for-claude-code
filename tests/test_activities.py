@@ -497,3 +497,50 @@ def test_task_numbers_restart_with_each_plan():
     ])
     # plan 1: Task 1 (2), final + its fix-wave re-review (2); plans 2, 3: Task 1; PR #9 (2)
     assert summary["passes_per_target"] == {"2": 3, "1": 2}
+
+
+def test_timeline_joins_consecutive_calls_of_one_activity():
+    t = ActivityTracker()
+    for line in [
+        _prompt(0),
+        _call(2, "r1", [("Read", {"file_path": "a.py"})]), _result(3, "r1-0"),
+        _call(5, "r2", [("Edit", {"file_path": "a.py"})]), _result(6, "r2-0"),
+        _call(8, "r3", [("Edit", {"file_path": "b.py"})]), _result(9, "r3-0"),
+        _call(11, "r4", [("Bash", {"command": "uv run pytest -q"})]), _result(71, "r4-0"),
+        _prompt(3000),                       # 50 min later: a new segment even if same activity
+        _call(3002, "r5", [("Bash", {"command": "uv run pytest -q"})]), _result(3010, "r5-0"),
+    ]:
+        t.feed(line)
+    segs = t.timeline()
+    assert [(s[2], s[3], s[4]) for s in segs] == [
+        ("explore", 1, "Read *.py"), ("code", 2, "Edit *.py"), ("test", 1, "pytest"), ("test", 1, "pytest")]
+    start = segs[0][0]
+    assert [(s[0] - start, s[1] - start) for s in segs[:3]] == [(0, 2000), (3000, 8000), (9000, 71000)]
+
+
+def test_timer_after_a_background_agent_is_untimed_coordination():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Bash", {"command": "uv run pytest -q"})]), _result(31, "r1-0"),
+        _call(32, "r2", [("Agent", {"description": "Implement Task 2", "run_in_background": True})]),
+        _with_text(_result(33, "r2-0"), "Async agent launched. agentId: a1"),
+        _call(34, "r3", [("Bash", {"command": "sleep 600"})]),
+        _result(634, "r3-0"),
+    ])
+    assert r["by_activity"]["coord"]["time_ms"] == 1000 + 1000  # the two generations only
+    assert "wait → Agent (general-purpose)" in r["items"]["coord"]
+    assert r["by_activity"]["test"]["time_ms"] == 31000
+
+
+def test_background_timer_on_a_subagent_is_untimed_via_task_output():
+    r = _run([
+        _prompt(0),
+        _call(1, "r1", [("Agent", {"description": "Implement Task 2", "run_in_background": True})]),
+        _with_text(_result(2, "r1-0"), "Async agent launched. agentId: a1"),
+        _call(3, "r2", [("Bash", {"command": "sleep 600", "run_in_background": True})]),
+        _with_text(_result(4, "r2-0"), "Command running in background with ID: bt1."),
+        _call(5, "r3", [("TaskOutput", {"task_id": "bt1"})]),
+        _result(605, "r3-0"),
+    ])
+    assert set(r["by_activity"]) == {"coord"}
+    assert r["by_activity"]["coord"]["time_ms"] == 3000  # three generations, no waiting
